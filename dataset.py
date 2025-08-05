@@ -456,7 +456,7 @@ def load_mm_emb(mm_path, feat_ids):
         if feat_id != '81':
             try:
                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*.json'):
+                for json_file in base_path.glob('*'):
                     with open(json_file, 'r', encoding='utf-8') as file:
                         for line in file:
                             data_dict_origin = json.loads(line.strip())

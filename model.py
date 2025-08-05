@@ -7,6 +7,101 @@ from tqdm import tqdm
 
 from dataset import save_emb
 
+def _hstu_attention_maybe_from_cache(
+    num_heads: int,
+    attention_dim: int,
+    linear_dim: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor  # [bs, 1, n, n]
+):
+    B, _, n, _ = attention_mask.size()
+
+    qk_attn = torch.einsum(
+        "bnhd,bmhd->bhnm",
+        q.view(B, n, num_heads, attention_dim),
+        k.view(B, n, num_heads, attention_dim),
+    )
+    qk_attn = F.silu(qk_attn) / n
+    qk_attn = qk_attn * attention_mask
+    # print(f"{qk_attn.size() = } {v.size() = }")
+    attn_output = torch.einsum(
+        "bhnm,bmhd->bnhd",
+        qk_attn,
+        v.reshape(B, n, num_heads, linear_dim),
+    ).reshape(B, n, num_heads * linear_dim)
+    return attn_output
+
+class HSTUAttention(torch.nn.Module):
+    def __init__(self, hidden_units, num_heads, dropout_rate, concat_ua=True):
+        super(HSTUAttention, self).__init__()
+
+        self.hidden_units = hidden_units
+        self.num_heads = num_heads
+        self.head_dim = hidden_units // num_heads
+        self.dropout_rate = dropout_rate
+
+        assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
+
+        self.concat_ua = concat_ua
+        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self.u_linear = torch.nn.Linear(hidden_units, hidden_units)
+
+        self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self._o = torch.nn.Linear(
+            in_features=hidden_units * (3 if concat_ua else 1),
+            out_features=hidden_units,
+        )
+        self._eps = 1e-8
+
+    def _norm_attn_output(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(
+            x, normalized_shape=[self.head_dim * self.num_heads], eps=self._eps
+        )
+
+    def forward(self, query, key, value, attn_mask=None):
+        batch_size, seq_len, _ = query.size()
+
+        # 计算Q, K, V
+        Q = self.q_linear(query)
+        K = self.k_linear(key)
+        V = self.v_linear(value)
+        U = self.u_linear(value)
+
+        Q = F.silu(Q)
+        K = F.silu(K)
+        V = F.silu(V)
+        U = F.silu(U)
+
+        attn_output = _hstu_attention_maybe_from_cache(
+            num_heads=self.num_heads,
+            attention_dim=self.head_dim,
+            linear_dim=self.head_dim,
+            q=Q,
+            k=K,
+            v=V,
+            attention_mask=attn_mask.unsqueeze(1)
+        )
+
+        if self.concat_ua:
+            A = self._norm_attn_output(attn_output)
+            o_input = torch.cat([U, A, U * A], dim=-1)
+        else:
+            o_input = U * self._norm_attn_output(attn_output)
+
+        new_outputs = (
+            self._o(
+                F.dropout(
+                    o_input,
+                    p=self.dropout_rate,
+                    training=self.training,
+                )
+            )
+        )
+        return new_outputs, None
 
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
@@ -127,9 +222,11 @@ class BaselineModel(torch.nn.Module):
 
         self._init_feat_info(feat_statistics, feat_types)
 
+        # 用户id对应的嵌入向量 + 稀疏特征对应的嵌入向量 + 数组特征对应的嵌入向量
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
         )
+        # (商品id对应的嵌入向量 + 稀疏特征对应的嵌入向量 +      ) + 连续特征 + 多模态的embeding特征转换的嵌入向量 
         itemdim = (
             args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
             + len(self.ITEM_CONTINUAL_FEAT)
@@ -145,9 +242,14 @@ class BaselineModel(torch.nn.Module):
             new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
             self.attention_layernorms.append(new_attn_layernorm)
 
-            new_attn_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )  # 优化：用FlashAttention替代标准Attention
+            if args.use_hstu_attn:
+                new_attn_layer = HSTUAttention(
+                    args.hidden_units, args.num_heads, args.dropout_rate, args.concat_ua
+                )
+            else:
+                new_attn_layer = FlashMultiHeadAttention(
+                    args.hidden_units, args.num_heads, args.dropout_rate
+                )  # 优化：用FlashAttention替代标准Attention
             self.attention_layers.append(new_attn_layer)
 
             new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
@@ -195,12 +297,16 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = len(seq_feature)
 
+        # 处理某一个特征, 如果是array类型
         if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
             # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
+            # 序列长度最大值, 这个特征数组的最长值
             max_array_len = 0
             max_seq_len = 0
 
+            # 每一个item是一个用户的序列
             for i in range(batch_size):
+                # 取其中某个feat的特征序列
                 seq_data = [item[k] for item in seq_feature[i]]
                 max_seq_len = max(max_seq_len, len(seq_data))
                 max_array_len = max(max_array_len, max(len(item_data) for item_data in seq_data))
@@ -211,6 +317,7 @@ class BaselineModel(torch.nn.Module):
                 for j, item_data in enumerate(seq_data):
                     actual_len = min(len(item_data), max_array_len)
                     batch_data[i, j, :actual_len] = item_data[:actual_len]
+            # 后面补充为0
 
             return torch.from_numpy(batch_data).to(self.dev)
         else:
@@ -272,10 +379,14 @@ class BaselineModel(torch.nn.Module):
             for k in feat_dict:
                 tensor_feature = self.feat2tensor(feature_array, k)
 
+                # [batch_size, max_len] -> [batch_size, max_len, emb_dim]
                 if feat_type.endswith('sparse'):
                     feat_list.append(self.sparse_emb[k](tensor_feature))
+                # [batch_size, max_len, ndim] -> [batch_size, max_len, ndim, emb_dim]
+                # 对嵌入得到的进行聚合
                 elif feat_type.endswith('array'):
                     feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
+                # [batch_size, max_len] -> [batch_size, max_len, 1]
                 elif feat_type.endswith('continual'):
                     feat_list.append(tensor_feature.unsqueeze(2))
 
@@ -285,6 +396,7 @@ class BaselineModel(torch.nn.Module):
             emb_dim = self.ITEM_EMB_FEAT[k]
             seq_len = len(feature_array[0])
 
+            # 每一个item_emb_feat -> [batch_size, seq_len, mm_emb_dim]-> [batch_size, seq_len, emb_dim]
             # pre-allocate tensor
             batch_emb_data = np.zeros((batch_size, seq_len, emb_dim), dtype=np.float32)
 
@@ -298,6 +410,7 @@ class BaselineModel(torch.nn.Module):
             item_feat_list.append(self.emb_transform[k](tensor_feature))
 
         # merge features
+        # 总的feature向量 [batch_size, maxlen, feature_dim]
         all_item_emb = torch.cat(item_feat_list, dim=2)
         all_item_emb = torch.relu(self.itemdnn(all_item_emb))
         if include_user:
@@ -320,10 +433,12 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
+        # [hidden_units]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= log_seqs != 0
+        # [batch_size, maxlen, hidden_units]
         seqs += self.pos_emb(poss)
         seqs = self.emb_dropout(seqs)
 
@@ -331,6 +446,7 @@ class BaselineModel(torch.nn.Module):
         ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
         attention_mask_tril = torch.tril(ones_matrix)
         attention_mask_pad = (mask != 0).to(self.dev)
+        # [1, maxlen, maxlen] & [batch_size, 1, maxlen] -> [batch_size, maxlen, maxlen] 然后保留下三角
         attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
 
         for i in range(len(self.attention_layers)):
@@ -414,18 +530,22 @@ class BaselineModel(torch.nn.Module):
         for start_idx in tqdm(range(0, len(item_ids), batch_size), desc="Saving item embeddings"):
             end_idx = min(start_idx + batch_size, len(item_ids))
 
+            # [0, batch_size]
             item_seq = torch.tensor(item_ids[start_idx:end_idx], device=self.dev).unsqueeze(0)
             batch_feat = []
             for i in range(start_idx, end_idx):
                 batch_feat.append(feat_dict[i])
 
+            # batch_size
             batch_feat = np.array(batch_feat, dtype=object)
 
+            # 得到表征
             batch_emb = self.feat2emb(item_seq, [batch_feat], include_user=False).squeeze(0)
 
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
         # 合并所有批次的结果并保存
+        # 得到所有的embedding和 ids
         final_ids = np.array(retrieval_ids, dtype=np.uint64).reshape(-1, 1)
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))
