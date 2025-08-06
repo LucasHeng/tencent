@@ -11,4 +11,4 @@ echo ${RUNTIME_SCRIPT_DIR}
 cd ${RUNTIME_SCRIPT_DIR}
 
 # write your code below
-python -u main.py --mm_emb_id 82 --hidden_units 128 --num_blocks 3 --num_heads 8 --l2_emb 0.1 --num_epochs 100 --use_hstu_attn
+python -u main.py --hidden_units 128 --num_blocks 3 --num_heads 8 --mm_emb_id 81 82 --l2_emb 0.1 --num_epochs 4 --use_hstu_attn
