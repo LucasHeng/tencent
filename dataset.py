@@ -6,8 +6,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
-
-
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Pool
 class MyDataset(torch.utils.data.Dataset):
     """
     用户序列数据集
@@ -18,6 +19,7 @@ class MyDataset(torch.utils.data.Dataset):
 
     Attributes:
         data_dir: 数据文件目录
+        save_path: 保存文件目录
         maxlen: 最大长度
         item_feat_dict: 物品特征字典
         mm_emb_ids: 激活的mm_emb特征ID
@@ -32,18 +34,24 @@ class MyDataset(torch.utils.data.Dataset):
         feat_statistics: 特征统计信息，包括user和item的特征数量
     """
 
-    def __init__(self, data_dir, args):
+    def __init__(self, data_dir, save_path, args):
         """
         初始化数据集
         """
         super().__init__()
         self.data_dir = Path(data_dir)
+        self.save_path = Path(save_path)
         self._load_data_and_offsets()
         self.maxlen = args.maxlen
         self.mm_emb_ids = args.mm_emb_id
+        self.use_mm_emb_in_offset = args.use_mm_emb_in_offset
 
         self.item_feat_dict = json.load(open(Path(data_dir, "item_feat_dict.json"), 'r'))
-        self.mm_emb_dict = load_mm_emb(Path(data_dir, "creative_emb"), self.mm_emb_ids)
+        if self.use_mm_emb_in_offset:
+            self.offset_map = load_mm_emb_in_offset(Path(data_dir, "creative_emb"), self.mm_emb_ids, save_path)
+            self._load_emb_data()
+        else:
+            self.mm_emb_dict = load_mm_emb(Path(data_dir, "creative_emb"), self.mm_emb_ids)
         with open(self.data_dir / 'indexer.pkl', 'rb') as ff:
             indexer = pickle.load(ff)
             self.itemnum = len(indexer['i'])
@@ -54,6 +62,15 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer = indexer
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
+
+    def _load_emb_data(self):
+        """
+        加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
+        """
+        SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
+        for feat_id in self.mm_emb_ids:
+            shape = SHAPE_DICT[feat_id]   
+            self.mm_emb_files[feat_id] = open(Path(self.save_path, f'mm_emb_{feat_id}_{shape}.jsonl'), 'rb')
 
     def _load_data_and_offsets(self):
         """
@@ -77,6 +94,21 @@ class MyDataset(torch.utils.data.Dataset):
         line = self.data_file.readline()
         data = json.loads(line)
         return data
+
+    def _load_mm_emb(self, uid, feat_id):
+        """
+        从数据文件中加载单个用户的数据
+
+        Args:
+            uid: 用户ID(reid)
+
+        Returns:
+            data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
+        """
+        self.mm_emb_files[feat_id].seek(self.offset_map[feat_id][uid])
+        line = self.mm_emb_files[feat_id].readline()
+        data = json.loads(line)
+        return data['emb']
 
     def _random_neq(self, l, r, s):
         """
@@ -260,9 +292,13 @@ class MyDataset(torch.utils.data.Dataset):
         for feat_id in missing_fields:
             filled_feat[feat_id] = self.feature_default_value[feat_id]
         for feat_id in self.feature_types['item_emb']:
-            if item_id != 0 and self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
-                if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
-                    filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+            if self.use_mm_emb_in_offset:
+                if item_id != 0 and self.indexer_i_rev[item_id] in self.offset_map[feat_id]:
+                    filled_feat[feat_id] = self._load_mm_emb(self.indexer_i_rev[item_id], feat_id)
+            else:
+                if item_id != 0 and self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
+                    if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
+                        filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
 
         return filled_feat
 
@@ -436,37 +472,101 @@ def save_emb(emb, save_path):
         f.write(struct.pack('II', num_points, num_dimensions))
         emb.tofile(f)
 
-def load_mm_emb_by_batch(mm_path, feat_ids):
+def load_mm_emb_in_offset(mm_path, feat_ids, output_path):
     """
     加载多模态特征Embedding
 
     Args:
         mm_path: 多模态特征Embedding路径
         feat_ids: 要加载的多模态特征ID列表
-
+        output_path: 保存路径
+        
     Returns:
-        mm_emb_dict: 多模态特征Embedding字典，key为特征ID，value为特征Embedding字典（key为item ID，value为Embedding）
+        offset_map: 多模态特征Embedding字典，key为特征ID，value为特征Embeddingoffset字典（key为item ID，value为文件中的offset与length）
     """
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
-    mm_emb_dict = {}
+    offset_map = {}
     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
         shape = SHAPE_DICT[feat_id]   
+        offset_dict = {}
         emb_dict = {}
-        if feat_id != '81':
-            try:
-                base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*.json'):
-                    with open(json_file, 'r', encoding='utf-8') as file:
-                        for line in file:
-                            data_dict_origin = json.loads(line.strip())
-                            insert_emb = data_dict_origin['emb']
-                            if isinstance(insert_emb, list):
-                                insert_emb = np.array(insert_emb, dtype=np.float32)
-                            data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
-                            emb_dict.update(data_dict)
-            except Exception as e:
-                print(f"transfer error: {e}")
+        feat_size_bytes = 0
+        with open(Path(output_path, f'mm_emb_{feat_id}_{shape}.jsonl'), 'w', encoding='utf-8') as out_file:
+            if feat_id != '81':
+                try:
+                    base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
+                    for json_file in base_path.glob('*.json'):
+                        feat_size_bytes += os.path.getsize(json_file)
+                        with open(json_file, 'r', encoding='utf-8') as file:
+                            for line in file:
+                                data_dict_origin = json.loads(line.strip())
+                                insert_emb = data_dict_origin['emb']
+                                if isinstance(insert_emb, list):
+                                    insert_emb = np.array(insert_emb, dtype=np.float32)
+                                # 记录当前的偏移
+                                current_offset = out_file.tell()
+                                cid = data_dict_origin['anonymous_cid']
+                                offset_dict[cid] = current_offset
+                                # 写入处理后的数据
+                                output_data = {
+                                    'emb': insert_emb.tolist()  # 转换为列表便于JSON序列化
+                                }
+                                json.dump(output_data, out_file, ensure_ascii=False)
+                                out_file.write('\n')  # 每行一个JSON对象
+
+                except Exception as e:
+                    print(f"transfer error: {e}")
+                    # 移除失败的记录
+                    if cid in offset_dict:
+                        del offset_dict[cid]
+            elif feat_id == '81':
+                with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
+                    file_stat = os.fstat(f.fileno())
+                    feat_size_bytes += file_stat.st_size
+                    emb_dict = pickle.load(f)
+                for cid, emb in emb_dict.items():
+                    try:
+                        # 记录当前偏移量
+                        current_offset = out_file.tell()
+                        offset_dict[cid] = current_offset
+                        
+                        # 准备要写入的数据（将numpy数组转为列表以便JSON序列化）
+                        output_data = {
+                            'emb': emb.tolist()
+                        }
+                        
+                        # 写入文件，每行一个JSON对象
+                        json.dump(output_data, out_file, ensure_ascii=False)
+                        out_file.write('\n')
+                        
+                    except Exception as e:
+                        print(f"写入记录失败 (cid: {cid}): {str(e)}")
+                        # 移除失败的记录
+                        if cid in offset_dict:
+                            del offset_dict[cid]
+        offset_map[feat_id] = offset_dict
+        print(f'Loaded #{feat_id} mm_emb mm_emb size: {feat_size_bytes}')
+
+    return offset_map
              
+def process_batch(file_paths):
+    local_dict = {}
+    files_size = 0
+    for json_file in file_paths:
+        try:
+            files_size += os.path.getsize(json_file)
+            with open(json_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    data = json.loads(line.strip())
+                    cid = data['anonymous_cid']
+                    emb = data['emb']
+                    if isinstance(emb, list):
+                        emb = np.array(emb, dtype=np.float32)
+                    kept_arr = emb[:32].copy()
+                    local_dict[cid] = kept_arr
+        except Exception as e:
+            print(f"Error processing {json_file}: {e}")
+    return local_dict, files_size
 
 def load_mm_emb(mm_path, feat_ids):
     """
@@ -481,26 +581,44 @@ def load_mm_emb(mm_path, feat_ids):
     """
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     mm_emb_dict = {}
+    num_threads = 9
     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
         shape = SHAPE_DICT[feat_id]
         emb_dict = {}
+        feat_size_bytes = 0
+        emb_count = 0
+        file_count = 0
         if feat_id != '81':
             try:
                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*'):
-                    with open(json_file, 'r', encoding='utf-8') as file:
-                        for line in file:
-                            data_dict_origin = json.loads(line.strip())
-                            insert_emb = data_dict_origin['emb']
-                            if isinstance(insert_emb, list):
-                                insert_emb = np.array(insert_emb, dtype=np.float32)
-                            data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
-                            emb_dict.update(data_dict)
+                file_paths = list(base_path.glob('*.json'))
+                file_count = len(file_paths)
+                batch_size = len(file_paths) // num_threads + 1
+                batches = [file_paths[i:i + batch_size] for i in range(0, len(file_paths), batch_size)]
+                with Pool(num_threads) as pool:
+                    for local_dict, file_size in pool.imap(process_batch, batches):
+                        feat_size_bytes += file_size
+                        emb_dict.update(local_dict)
+                # for json_file in base_path.glob('*.json'):
+                #     feat_size_bytes += os.path.getsize(json_file)
+                #     with open(json_file, 'r', encoding='utf-8') as file:
+                #         for line in file:
+                #             data_dict_origin = json.loads(line.strip())
+                #             insert_emb = data_dict_origin['emb']
+                #             if isinstance(insert_emb, list):
+                #                 insert_emb = np.array(insert_emb, dtype=np.float32)
+                #             kept_arr = insert_emb[:32].copy()
+                #             data_dict = {data_dict_origin['anonymous_cid']: kept_arr}
+                #             emb_dict.update(data_dict)
+                #             file_count += 1
             except Exception as e:
                 print(f"transfer error: {e}")
         if feat_id == '81':
             with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
                 emb_dict = pickle.load(f)
+                file_stat = os.fstat(f.fileno())
+                feat_size_bytes += file_stat.st_size
+        emb_count = len(emb_dict)
         mm_emb_dict[feat_id] = emb_dict
-        print(f'Loaded #{feat_id} mm_emb')
+        print(f'Loaded #{feat_id} mm_emb size: {feat_size_bytes} emb_count: {emb_count} file_count:{file_count}')
     return mm_emb_dict
