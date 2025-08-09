@@ -60,17 +60,17 @@ class InfoNCE(nn.Module):
                         negative_mode=self.negative_mode)
 
 
-def info_nce(query, positive_key, negative_keys=None, indices=None, temperature=0.1, reduction='mean', negative_mode='unpaired'):
+def info_nce(query, positive_key, negative_keys=None, temperature=0.1, reduction='mean', negative_mode='unpaired'):
     # Check input dimensionality.
     if query.dim() != 2:
-        raise ValueError('<query> must have 3 dimensions.')
+        raise ValueError('<query> must have 2 dimensions.')
     if positive_key.dim() != 2:
-        raise ValueError('<positive_key> must have 3 dimensions.')
+        raise ValueError('<positive_key> must have 2 dimensions.')
     if negative_keys is not None:
         if negative_mode == 'unpaired' and negative_keys.dim() != 2:
-            raise ValueError("<negative_keys> must have 3 dimensions if <negative_mode> == 'unpaired'.")
+            raise ValueError("<negative_keys> must have 2 dimensions if <negative_mode> == 'unpaired'.")
         if negative_mode == 'paired' and negative_keys.dim() != 3:
-            raise ValueError("<negative_keys> must have 4 dimensions if <negative_mode> == 'paired'.")
+            raise ValueError("<negative_keys> must have 3 dimensions if <negative_mode> == 'paired'.")
 
     # Check matching number of samples.
     if len(query) != len(positive_key):
@@ -91,21 +91,17 @@ def info_nce(query, positive_key, negative_keys=None, indices=None, temperature=
     if negative_keys is not None:
         # Explicit negative keys
 
-        # [B, S, H] * [B, S, H] -> [B, S]
         # Cosine between positive pairs
         positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
 
         if negative_mode == 'unpaired':
-            # [B, S, H] @ transpose(M, H) ->[B, S, M]
-            #[N, D] [M, D]->[N. M]
             # Cosine between all query-negative combinations
             negative_logits = query @ transpose(negative_keys)
 
         elif negative_mode == 'paired':
-            # [B,S,H] -> [B,S,1,H]
-            # [B,S,1,H] @ [B.S,H,M] -> [B, S, 1, M]
-            # [B,S,M]
+            query = query.unsqueeze(1)
             negative_logits = query @ transpose(negative_keys)
+            negative_logits = negative_logits.squeeze(1)
 
         # First index in last dimension are the positive samples
         logits = torch.cat([positive_logit, negative_logits], dim=1)
@@ -114,10 +110,6 @@ def info_nce(query, positive_key, negative_keys=None, indices=None, temperature=
         # Negative keys are implicitly off-diagonal positive keys.
 
         # Cosine between all combinations
-        # [B,S,H] @ transpos([B,S,H]) -> [BxS, S] @ transpos[BXS, H]
-        # -> [BxS, BxS]
-        query = query.reshape(-1, query.shape[-1])
-        positive_key = positive_key(-1, query.shape[-1])
         logits = query @ transpose(positive_key)
 
         # Positive keys are the entries on the diagonal
