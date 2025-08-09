@@ -205,6 +205,7 @@ class BaselineModel(torch.nn.Module):
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
+        self.use_all_in_batch = args.use_all_in_batch
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
         # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
@@ -492,7 +493,8 @@ class BaselineModel(torch.nn.Module):
 
         # [batch_size,  max_len, hidden_uinit]
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
-        neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
+        if not self.use_all_in_batch:
+            neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
         # [batch_size, max_len]
         # pos_logits = (log_feats * pos_embs).sum(dim=-1)
@@ -502,10 +504,12 @@ class BaselineModel(torch.nn.Module):
         # neg_logits = neg_logits * loss_mask
         log_feats = log_feats * loss_mask
         pos_embs = pos_embs * loss_mask
-        neg_embs = neg_embs * loss_mask
-
-        return log_feats, pos_embs, neg_embs
-
+        
+        if not self.use_all_in_batch:
+            neg_embs = neg_embs * loss_mask
+            return log_feats, pos_embs, neg_embs
+        else:
+            return log_feats, pos_embs, None
     def predict(self, log_seqs, seq_feature, mask):
         """
         计算用户序列的表征

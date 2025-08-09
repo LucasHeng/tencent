@@ -36,7 +36,6 @@ def get_args():
     parser.add_argument('--norm_first', action='store_true')
     parser.add_argument('--use_hstu_attn', action='store_true')
     parser.add_argument('--concat_ua', action='store_false')
-    parser.add_argument('--use_InfoNCE',action='store_true')
     parser.add_argument('--use_all_in_batch', action='store_true')
 
     # MMemb Feature ID
@@ -111,14 +110,18 @@ if __name__ == '__main__':
             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
             seq = seq.to(args.device)
             pos = pos.to(args.device)
-            neg = neg.to(args.device)
+            if not args.use_all_in_batch:
+                neg = neg.to(args.device)
             log_feats, pos_embs, neg_embs = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
 
             optimizer.zero_grad()
             indices = np.where(next_token_type == 1)
-            loss = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs[indices])
+            if not args.use_all_in_batch:
+                loss = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs[indices])
+            else:
+                loss = infonce_criterion(log_feats[indices], pos_embs[indices])
 
             log_json = json.dumps(
                 {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}
@@ -142,16 +145,16 @@ if __name__ == '__main__':
             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
             seq = seq.to(args.device)
             pos = pos.to(args.device)
-            neg = neg.to(args.device)
+            if not args.use_all_in_batch:
+                neg = neg.to(args.device)
             pos_logits, neg_logits = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
-            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(
-                neg_logits.shape, device=args.device
-            )
             indices = np.where(next_token_type == 1)
-            loss = infonce_criterion(pos_logits[indices], pos_labels[indices])
-            loss += infonce_criterion(neg_logits[indices], neg_labels[indices])
+            if not args.use_all_in_batch:
+                loss = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs[indices])
+            else:
+                loss = infonce_criterion(log_feats[indices], pos_embs[indices])
             valid_loss_sum += loss.item()
         valid_loss_sum /= len(valid_loader)
         writer.add_scalar('Loss/valid', valid_loss_sum, global_step)

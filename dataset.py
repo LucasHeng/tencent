@@ -52,6 +52,7 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer_i_rev = {v: k for k, v in indexer['i'].items()}
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
+        self.use_all_in_batch = args.use_all_in_batch
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
 
@@ -156,9 +157,10 @@ class MyDataset(torch.utils.data.Dataset):
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
-                neg_id = self._random_neq(1, self.itemnum + 1, ts)
-                neg[idx] = neg_id
-                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                if not self.use_all_in_batch:
+                    neg_id = self._random_neq(1, self.itemnum + 1, ts)
+                    neg[idx] = neg_id
+                    neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
             nxt = record_tuple
             idx -= 1
             if idx == -1:
@@ -166,10 +168,10 @@ class MyDataset(torch.utils.data.Dataset):
 
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
-        neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
-
+        if not self.use_all_in_batch:
+            neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
+            
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-
     def __len__(self):
         """
         返回数据集长度，即用户数量
