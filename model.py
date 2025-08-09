@@ -419,6 +419,7 @@ class BaselineModel(torch.nn.Module):
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+        # [batch_size, maxlen, hidden_unit]
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature):
@@ -433,7 +434,7 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
-        # [hidden_units]
+        # [batch_size, maxlen, hidden_unit]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
@@ -485,18 +486,25 @@ class BaselineModel(torch.nn.Module):
             pos_logits: 正样本logits，形状为 [batch_size, maxlen]
             neg_logits: 负样本logits，形状为 [batch_size, maxlen]
         """
+        # [batch_size, max_len, hidden_uinit]
         log_feats = self.log2feats(user_item, mask, seq_feature)
-        loss_mask = (next_mask == 1).to(self.dev)
+        loss_mask = (next_mask == 1).to(self.dev).unsqueeze(2)
 
+        # [batch_size,  max_len, hidden_uinit]
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
 
-        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-        pos_logits = pos_logits * loss_mask
-        neg_logits = neg_logits * loss_mask
+        # [batch_size, max_len]
+        # pos_logits = (log_feats * pos_embs).sum(dim=-1)
+        # neg_logits = (log_feats * neg_embs).sum(dim=-1)
+    
+        # pos_logits = pos_logits * loss_mask
+        # neg_logits = neg_logits * loss_mask
+        log_feats = log_feats * loss_mask
+        pos_embs = pos_embs * loss_mask
+        neg_embs = neg_embs * loss_mask
 
-        return pos_logits, neg_logits
+        return log_feats, pos_embs, neg_embs
 
     def predict(self, log_seqs, seq_feature, mask):
         """
