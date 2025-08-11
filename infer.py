@@ -11,6 +11,18 @@ from tqdm import tqdm
 
 from dataset import MyTestDataset, save_emb
 from model import BaselineModel
+import torch.nn.functional as F
+import random
+
+def set_seed(seed=42, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)               # 为CPU设置种子
+    torch.cuda.manual_seed_all(seed)     # 为所有GPU设置种子
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"Random seed set as {seed}")
 
 
 def get_ckpt_path():
@@ -41,11 +53,16 @@ def get_args():
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', action='store_true')
+    parser.add_argument('--use_hstu_attn', action='store_true')
+    parser.add_argument('--concat_ua', action='store_false')
+    parser.add_argument('--use_all_in_batch', action='store_true')
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
 
-    args = parser.parse_args()
+    test_arg=["--hidden_units","128","--num_blocks","3","--num_heads","8" "--use_hstu_attn"]
+
+    args = parser.parse_args(test_arg)
 
     return args
 
@@ -140,6 +157,7 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
 
 
 def infer():
+    set_seed(42)
     args = get_args()
     data_path = os.environ.get('EVAL_DATA_PATH')
     test_dataset = MyTestDataset(data_path, args)
@@ -159,7 +177,9 @@ def infer():
 
         seq, token_type, seq_feat, user_id = batch
         seq = seq.to(args.device)
+        # 【batch, hidden_unit]
         logits = model.predict(seq, seq_feat, token_type)
+        # logits = F.normalize(logits, dim=-1)
         for i in range(logits.shape[0]):
             emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
             all_embs.append(emb)

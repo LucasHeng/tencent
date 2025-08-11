@@ -12,7 +12,18 @@ from tqdm import tqdm
 
 from dataset import MyDataset
 from model import BaselineModel
+from InfoNCE import InfoNCE
+import random
 
+def set_seed(seed=42, deterministic=True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)               # 为CPU设置种子
+    torch.cuda.manual_seed_all(seed)     # 为所有GPU设置种子
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    print(f"Random seed set as {seed}")
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -35,9 +46,11 @@ def get_args():
     parser.add_argument('--norm_first', action='store_true')
     parser.add_argument('--use_hstu_attn', action='store_true')
     parser.add_argument('--concat_ua', action='store_false')
+    parser.add_argument('--use_all_in_batch', action='store_true')
+    parser.add_argument('--sample_neg_num',  default=10, type=int)
 
     # MMemb Feature ID
-    parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 88)])
 
     args = parser.parse_args()
 
@@ -45,6 +58,7 @@ def get_args():
 
 
 if __name__ == '__main__':
+    set_seed(42)
     Path(os.environ.get('TRAIN_LOG_PATH')).mkdir(parents=True, exist_ok=True)
     Path(os.environ.get('TRAIN_TF_EVENTS_PATH')).mkdir(parents=True, exist_ok=True)
     log_file = open(Path(os.environ.get('TRAIN_LOG_PATH'), 'train.log'), 'w')
@@ -91,7 +105,7 @@ if __name__ == '__main__':
             print(args.state_dict_path)
             raise RuntimeError('failed loading state_dicts, pls check file path!')
 
-    bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+    infonce_criterion = InfoNCE(reduction='mean')
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
 
     best_val_ndcg, best_val_hr = 0.0, 0.0
@@ -99,7 +113,6 @@ if __name__ == '__main__':
     T = 0.0
     t0 = time.time()
     global_step = 0
-    print("Start training")
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         model.train()
         if args.inference_only:
@@ -109,16 +122,18 @@ if __name__ == '__main__':
             seq = seq.to(args.device)
             pos = pos.to(args.device)
             neg = neg.to(args.device)
-            pos_logits, neg_logits = model(
+            log_feats, pos_embs, neg_embs, pos_mask = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
-            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(
-                neg_logits.shape, device=args.device
-            )
+
             optimizer.zero_grad()
             indices = np.where(next_token_type == 1)
-            loss = bce_criterion(pos_logits[indices], pos_labels[indices])
-            loss += bce_criterion(neg_logits[indices], neg_labels[indices])
+            if not args.use_all_in_batch:
+                loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+            else:
+                x_index,y_index = indices
+                selected_masks = pos_mask[indices]
+                loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], pos_mask=selected_masks[:,x_index,y_index])
 
             log_json = json.dumps(
                 {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}
@@ -128,33 +143,66 @@ if __name__ == '__main__':
             print(log_json)
 
             writer.add_scalar('Loss/train', loss.item(), global_step)
+            writer.add_scalar('Acc/train', acc, step)
+            writer.add_scalar('Top10_acc/train', Top10_acc, step)
+            writer.add_scalar('Pos_sim/train', pos_sim, step)
+            writer.add_scalar('Neg_sim/train', neg_sim, step)
 
             global_step += 1
 
             for param in model.item_emb.parameters():
                 loss += args.l2_emb * torch.norm(param)
             loss.backward()
+
+            total_norm = 0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)  # L2 范数
+                    total_norm += param_norm.item() ** 2
+            writer.add_scalar(f'Grad Norm', total_norm, step)
             optimizer.step()
+            print(f"Train Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Train Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
         model.eval()
         valid_loss_sum = 0
+        valid_acc_sum = 0
+        valid_pos_sim_sum = 0
+        valid_neg_sim_sum = 0
+        valid_Top10_acc_sum = 0
         for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader)):
             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
             seq = seq.to(args.device)
             pos = pos.to(args.device)
             neg = neg.to(args.device)
-            pos_logits, neg_logits = model(
+            log_feats, pos_embs, neg_embs, pos_mask  = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
-            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(
-                neg_logits.shape, device=args.device
-            )
             indices = np.where(next_token_type == 1)
-            loss = bce_criterion(pos_logits[indices], pos_labels[indices])
-            loss += bce_criterion(neg_logits[indices], neg_labels[indices])
+            if not args.use_all_in_batch:
+                loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs[indices])
+            else:
+                x_index,y_index = indices
+                selected_masks = pos_mask[indices]
+                loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], pos_mask=selected_masks[:,x_index,y_index])
             valid_loss_sum += loss.item()
+            valid_acc_sum += acc
+            valid_pos_sim_sum += pos_sim.item()
+            valid_neg_sim_sum += neg_sim.item()
+            valid_Top10_acc_sum += Top10_acc.item()
+            print(f"Valid Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"Valid Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
+
+        valid_acc_sum/=len(valid_loader)
+        valid_Top10_acc_sum/=len(valid_loader)
+        valid_pos_sim_sum/=len(valid_loader)
+        valid_neg_sim_sum/=len(valid_loader)
         valid_loss_sum /= len(valid_loader)
         writer.add_scalar('Loss/valid', valid_loss_sum, global_step)
+        writer.add_scalar('Acc/valid', valid_acc_sum, global_step)
+        writer.add_scalar('Top10_acc/valid', valid_Top10_acc_sum, global_step)
+        writer.add_scalar('Pos_sim/valid', valid_pos_sim_sum, global_step)
+        writer.add_scalar('Neg_sim/valid', valid_neg_sim_sum, global_step)
 
         save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_sum:.4f}")
         save_dir.mkdir(parents=True, exist_ok=True)

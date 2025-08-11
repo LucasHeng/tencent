@@ -48,10 +48,13 @@ class MyDataset(torch.utils.data.Dataset):
             indexer = pickle.load(ff)
             self.itemnum = len(indexer['i'])
             self.usernum = len(indexer['u'])
+            print(f'itemnum {self.itemnum} and usernum {self.usernum}')
         # itemid 与 reconstruct id
         self.indexer_i_rev = {v: k for k, v in indexer['i'].items()}
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
+        self.use_all_in_batch = args.use_all_in_batch
+        self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
 
@@ -78,7 +81,7 @@ class MyDataset(torch.utils.data.Dataset):
         data = json.loads(line)
         return data
 
-    def _random_neq(self, l, r, s):
+    def _random_neq(self, l, r, s,neg_num=1):
         """
         生成一个不在序列s中的随机整数, 用于训练时的负采样
 
@@ -90,10 +93,13 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             t: 不在序列s中的随机整数
         """
-        t = np.random.randint(l, r)
-        while t in s or str(t) not in self.item_feat_dict:
+        neg_samps = []
+        for i in range(neg_num):
             t = np.random.randint(l, r)
-        return t
+            while t in s or str(t) not in self.item_feat_dict:
+                t = np.random.randint(l, r)
+            neg_samps.append(t)
+        return neg_samps
 
     def __getitem__(self, uid):
         """
@@ -124,14 +130,14 @@ class MyDataset(torch.utils.data.Dataset):
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
-        neg = np.zeros([self.maxlen + 1], dtype=np.int32)
+        neg = np.zeros([self.maxlen + 1, self.sample_neg_num], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_action_type = np.zeros([self.maxlen + 1], dtype=np.int32)
 
         seq_feat = np.empty([self.maxlen + 1], dtype=object)
         pos_feat = np.empty([self.maxlen + 1], dtype=object)
-        neg_feat = np.empty([self.maxlen + 1], dtype=object)
+        neg_feat = np.empty([self.maxlen + 1, self.sample_neg_num], dtype=object)
 
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
@@ -156,9 +162,11 @@ class MyDataset(torch.utils.data.Dataset):
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
-                neg_id = self._random_neq(1, self.itemnum + 1, ts)
-                neg[idx] = neg_id
-                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                if not self.use_all_in_batch:
+                    neg_ids = self._random_neq(1, self.itemnum + 1, ts, self.sample_neg_num)
+                    neg[idx] = neg_ids
+                    for id,neg_id in enumerate(neg_ids):
+                        neg_feat[idx][id] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
             nxt = record_tuple
             idx -= 1
             if idx == -1:
@@ -166,10 +174,10 @@ class MyDataset(torch.utils.data.Dataset):
 
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
-        neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
-
+        if not self.use_all_in_batch:
+            neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
+            
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-
     def __len__(self):
         """
         返回数据集长度，即用户数量

@@ -205,6 +205,7 @@ class BaselineModel(torch.nn.Module):
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
+        self.use_all_in_batch = args.use_all_in_batch
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
         # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
@@ -347,11 +348,13 @@ class BaselineModel(torch.nn.Module):
         if include_user:
             user_mask = (mask == 2).to(self.dev)
             item_mask = (mask == 1).to(self.dev)
+            # [batch_size, seq_len, embed_dim]
             user_embedding = self.user_emb(user_mask * seq)
             item_embedding = self.item_emb(item_mask * seq)
             item_feat_list = [item_embedding]
             user_feat_list = [user_embedding]
         else:
+            # [batch_size, embed_dim]
             item_embedding = self.item_emb(seq)
             item_feat_list = [item_embedding]
 
@@ -410,7 +413,7 @@ class BaselineModel(torch.nn.Module):
             item_feat_list.append(self.emb_transform[k](tensor_feature))
 
         # merge features
-        # 总的feature向量 [batch_size, maxlen, feature_dim]
+        # 总的feature向量 [batch_size, feature_dim]
         all_item_emb = torch.cat(item_feat_list, dim=2)
         all_item_emb = torch.relu(self.itemdnn(all_item_emb))
         if include_user:
@@ -419,6 +422,7 @@ class BaselineModel(torch.nn.Module):
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+        # [batch_size, maxlen, hidden_unit]
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature):
@@ -433,7 +437,7 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
-        # [hidden_units]
+        # [batch_size, maxlen, hidden_unit]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
@@ -464,6 +468,26 @@ class BaselineModel(torch.nn.Module):
 
         return log_feats
 
+    def posmask(self, pos_seqs):
+        batch_size = pos_seqs.shape[0]
+        max_seq_len = pos_seqs.shape[1]
+        # Step 1: 扩展 A 用于广播比较
+        # A_rows: shape (B, 1, S) -> 每一行作为一个集合
+        # A_all:  shape (1, B, S) -> 所有元素
+        # 
+        A_rows = pos_seqs.unsqueeze(1)   # shape (B, 1, S)
+        A_rows= A_rows.unsqueeze(2) #(B, 1, 1, S)
+        A_all = pos_seqs.unsqueeze(0)    # shape (1, B, S)
+        A_all = A_all.unsqueeze(3) # shape (1, B, S, 1)
+
+        # Step 2: 比较：A_all 中的每个元素是否在 A_rows 中出现过
+        # 得到 (B, B, S) 的布尔张量
+        row_masks = (A_all == A_rows).any(dim=3)  # shape (B, B, S)
+        # Step 3: 扩展成 (B, S, B, S)，每个 (i,j) 对应一个 [B, S] 的 mask
+        mask_expanded = row_masks.unsqueeze(1).expand(-1, max_seq_len, -1, -1)  # shape (B, S, B, S)
+
+        return mask_expanded
+        
     def forward(
         self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
     ):
@@ -485,19 +509,42 @@ class BaselineModel(torch.nn.Module):
             pos_logits: 正样本logits，形状为 [batch_size, maxlen]
             neg_logits: 负样本logits，形状为 [batch_size, maxlen]
         """
+        # [batch_size, max_len, hidden_uinit]
         log_feats = self.log2feats(user_item, mask, seq_feature)
         loss_mask = (next_mask == 1).to(self.dev)
 
+        if  self.use_all_in_batch:
+            pos_mask = self.posmask(pos_seqs)
+            pos_mask = pos_mask * loss_mask
+
+        # [batch_size,  max_len, hidden_uinit]
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
-        neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
+        if not self.use_all_in_batch:
+            neg_feat = np.array(neg_feature)
+            batch_size = neg_seqs.shape[0]
+            seq_len = neg_seqs.shape[1]
+            neg_num = neg_seqs.shape[2]
+            neg_seqs = neg_seqs.reshape(batch_size, -1)
+            neg_feat = neg_feat.reshape(batch_size, -1)
+            neg_embs = self.feat2emb(neg_seqs, neg_feat, include_user=False)
+            neg_embs = neg_embs.reshape(batch_size, seq_len, neg_num, -1)
 
-        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-        pos_logits = pos_logits * loss_mask
-        neg_logits = neg_logits * loss_mask
-
-        return pos_logits, neg_logits
-
+        # [batch_size, max_len]
+        # pos_logits = (log_feats * pos_embs).sum(dim=-1)
+        # neg_logits = (log_feats * neg_embs).sum(dim=-1)
+    
+        # pos_logits = pos_logits * loss_mask
+        # neg_logits = neg_logits * loss_mask
+        # 这个log_feats不应该乘log
+        print(f'pos_embs {pos_embs.shape} loss_mask {loss_mask.shape}')
+        loss_mask = loss_mask.unsqueeze(-1)
+        pos_embs = pos_embs * loss_mask
+        
+        if not self.use_all_in_batch:
+            neg_embs = neg_embs.reshape(-1, neg_embs.shape[-1])
+            return log_feats, pos_embs, neg_embs, None
+        else:
+            return log_feats, pos_embs, None, pos_mask
     def predict(self, log_seqs, seq_feature, mask):
         """
         计算用户序列的表征
@@ -540,7 +587,9 @@ class BaselineModel(torch.nn.Module):
             batch_feat = np.array(batch_feat, dtype=object)
 
             # 得到表征
+            # [batch_size, hidden_unit]
             batch_emb = self.feat2emb(item_seq, [batch_feat], include_user=False).squeeze(0)
+            batch_emb = F.normalize(batch_emb, dim=-1)
 
             all_embs.append(batch_emb.detach().cpu().numpy().astype(np.float32))
 
