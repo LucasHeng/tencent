@@ -6,6 +6,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
+from collections import defaultdict
+import math
+import random
+import os
+import threading
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -32,12 +37,13 @@ class MyDataset(torch.utils.data.Dataset):
         feat_statistics: 特征统计信息，包括user和item的特征数量
     """
 
-    def __init__(self, data_dir, args):
+    def __init__(self, data_dir, args, save_path):
         """
         初始化数据集
         """
         super().__init__()
         self.data_dir = Path(data_dir)
+        self.save_path = save_path
         self._load_data_and_offsets()
         self.maxlen = args.maxlen
         self.mm_emb_ids = args.mm_emb_id
@@ -48,13 +54,14 @@ class MyDataset(torch.utils.data.Dataset):
             indexer = pickle.load(ff)
             self.itemnum = len(indexer['i'])
             self.usernum = len(indexer['u'])
+            # print(f'itemnum {self.itemnum} and usernum {self.usernum}')
         # itemid 与 reconstruct id
         self.indexer_i_rev = {v: k for k, v in indexer['i'].items()}
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
+        self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-
     def _load_data_and_offsets(self):
         """
         加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
@@ -62,6 +69,17 @@ class MyDataset(torch.utils.data.Dataset):
         self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
+
+    def _get_file_handle(self):
+        """每个worker进程只打开一次文件，返回复用的句柄"""
+        # 检查当前进程是否已打开文件
+        if not hasattr(self.local_storage, 'file'):
+            # 首次访问时打开文件（每个worker进程执行一次）
+            self.local_storage.file = open(self.data_dir / "seq.jsonl", 'r')
+            # 打印进程ID和文件句柄信息（验证用）
+            import os
+            print(f"进程 {os.getpid()} 打开文件句柄: {self.local_storage.file.fileno()}")
+        return self.local_storage.file
 
     def _load_user_data(self, uid):
         """
@@ -73,12 +91,13 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
-        self.data_file.seek(self.seq_offsets[uid])
-        line = self.data_file.readline()
+        data_file = self._get_file_handle()
+        data_file.seek(self.seq_offsets[uid])
+        line = data_file.readline()
         data = json.loads(line)
         return data
 
-    def _random_neq(self, l, r, s):
+    def _random_neq(self, l, r, s,neg_num=1):
         """
         生成一个不在序列s中的随机整数, 用于训练时的负采样
 
@@ -90,10 +109,85 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             t: 不在序列s中的随机整数
         """
-        t = np.random.randint(l, r)
-        while t in s or str(t) not in self.item_feat_dict:
+        neg_samps = []
+        for i in range(neg_num):
             t = np.random.randint(l, r)
-        return t
+            while t in s or str(t) not in self.item_feat_dict:
+                t = np.random.randint(l, r)
+            neg_samps.append(t)
+        return neg_samps
+
+    def cl4srec_aug(self, cur_data):
+        def item_crop(seq, length, eta=0.6):
+            num_left = math.floor(length * eta)
+            crop_begin = random.randint(0, length - num_left)
+            croped_item_seq = np.zeros(seq.shape[0])
+            if crop_begin + num_left < seq.shape[0]:
+                croped_item_seq[:num_left] = seq[crop_begin:crop_begin + num_left]
+            else:
+                croped_item_seq[:num_left] = seq[crop_begin:]
+            return torch.tensor(croped_item_seq, dtype=torch.long), torch.tensor(num_left, dtype=torch.long)
+        
+        def item_mask(seq, length, gamma=0.3):
+            num_mask = math.floor(length * gamma)
+            mask_index = random.sample(range(length), k=num_mask)
+            masked_item_seq = seq[:]
+            masked_item_seq[mask_index] = self.dataset.item_num  # token 0 has been used for semantic masking
+            return masked_item_seq, length
+        
+        def item_reorder(seq, length, beta=0.6):
+            num_reorder = math.floor(length * beta)
+            reorder_begin = random.randint(0, length - num_reorder)
+            reordered_item_seq = seq[:]
+            shuffle_index = list(range(reorder_begin, reorder_begin + num_reorder))
+            random.shuffle(shuffle_index)
+            reordered_item_seq[reorder_begin:reorder_begin + num_reorder] = reordered_item_seq[shuffle_index]
+            return reordered_item_seq, length
+        
+        seqs = cur_data['item_id_list']
+        lengths = cur_data['item_length']
+
+        aug_seq1 = []
+        aug_len1 = []
+        aug_seq2 = []
+        aug_len2 = []
+        for seq, length in zip(seqs, lengths):
+            if length > 1:
+                switch = random.sample(range(3), k=2)
+            else:
+                switch = [3, 3]
+                aug_seq = seq
+                aug_len = length
+            if switch[0] == 0:
+                aug_seq, aug_len = item_crop(seq, length)
+            elif switch[0] == 1:
+                aug_seq, aug_len = item_mask(seq, length)
+            elif switch[0] == 2:
+                aug_seq, aug_len = item_reorder(seq, length)
+    
+            aug_seq1.append(aug_seq)
+            aug_len1.append(aug_len)
+    
+            if switch[1] == 0:
+                aug_seq, aug_len = item_crop(seq, length)
+            elif switch[1] == 1:
+                aug_seq, aug_len = item_mask(seq, length)
+            elif switch[1] == 2:
+                aug_seq, aug_len = item_reorder(seq, length)
+    
+            aug_seq2.append(aug_seq)
+            aug_len2.append(aug_len)
+
+    def _collect_item_info(self):
+        for i in tqdm(range(self.usernum)):
+            user_sequence = self._iterate_user_data(i)
+            for record_tuple in user_sequence:
+                u, i, user_feat, item_feat, action_type, _ = record_tuple
+                if i and item_feat:
+                    if action_type == 0:
+                        self.view_i_count[i] += 1
+                    else:
+                        self.hit_i_count[i] += 1
 
     def __getitem__(self, uid):
         """
@@ -112,6 +206,7 @@ class MyDataset(torch.utils.data.Dataset):
             pos_feat: 正样本特征，每个元素为字典，key为特征ID，value为特征值
             neg_feat: 负样本特征，每个元素为字典，key为特征ID，value为特征值
         """
+        
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
 
         ext_user_sequence = []
@@ -124,14 +219,14 @@ class MyDataset(torch.utils.data.Dataset):
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
-        neg = np.zeros([self.maxlen + 1], dtype=np.int32)
+        neg = np.zeros([self.maxlen + 1, self.sample_neg_num], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_action_type = np.zeros([self.maxlen + 1], dtype=np.int32)
 
         seq_feat = np.empty([self.maxlen + 1], dtype=object)
         pos_feat = np.empty([self.maxlen + 1], dtype=object)
-        neg_feat = np.empty([self.maxlen + 1], dtype=object)
+        neg_feat = np.empty([self.maxlen + 1, self.sample_neg_num], dtype=object)
 
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
@@ -156,9 +251,10 @@ class MyDataset(torch.utils.data.Dataset):
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
-                neg_id = self._random_neq(1, self.itemnum + 1, ts)
-                neg[idx] = neg_id
-                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                neg_ids = self._random_neq(1, self.itemnum + 1, ts, self.sample_neg_num)
+                neg[idx] = neg_ids
+                for id,neg_id in enumerate(neg_ids):
+                    neg_feat[idx][id] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
             nxt = record_tuple
             idx -= 1
             if idx == -1:
@@ -206,6 +302,8 @@ class MyDataset(torch.utils.data.Dataset):
             '115',
             '122',
             '116',
+            '99',
+            '98',
         ]
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
@@ -233,6 +331,9 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = np.zeros(
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
             )
+        feat_statistics['99'] = 17
+        feat_statistics['98'] = 32
+        print(f'{feat_statistics}')
 
         return feat_default_value, feat_types, feat_statistics
 
@@ -263,6 +364,9 @@ class MyDataset(torch.utils.data.Dataset):
             if item_id != 0 and self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
                 if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
                     filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+
+        filled_feat['99'] = min(max(filled_feat['99'], self.view_i_count[item_id]), 17)
+        filled_feat['98'] = min(max(filled_feat['98'], self.hit_i_count[item_id]), 32)
 
         return filled_feat
 
@@ -456,7 +560,7 @@ def load_mm_emb(mm_path, feat_ids):
         if feat_id != '81':
             try:
                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*'):
+                for json_file in base_path.glob('*.json'):
                     with open(json_file, 'r', encoding='utf-8') as file:
                         for line in file:
                             data_dict_origin = json.loads(line.strip())
