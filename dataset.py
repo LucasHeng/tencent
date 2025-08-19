@@ -40,7 +40,10 @@ class MyDataset(torch.utils.data.Dataset):
         self.data_dir = Path(data_dir)
         self._load_data_and_offsets()
         self.maxlen = args.maxlen
-        self.mm_emb_ids = args.mm_emb_id
+        if args.skip_mm_emb:
+            self.mm_emb_ids = []
+        else:
+            self.mm_emb_ids = args.mm_emb_id
 
         self.item_feat_dict = json.load(open(Path(data_dir, "item_feat_dict.json"), 'r'))
         self.mm_emb_dict = load_mm_emb(Path(data_dir, "creative_emb"), self.mm_emb_ids)
@@ -177,6 +180,10 @@ class MyDataset(torch.utils.data.Dataset):
             seq[idx] = i
             token_type[idx] = type_
             next_token_type[idx] = next_type
+            if type_ == 1:
+                if act_type is None:
+                    act_type = -1
+                feat['99'] = act_type + 1
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
             seq_feat[idx] = feat
@@ -234,6 +241,7 @@ class MyDataset(torch.utils.data.Dataset):
             '115',
             '122',
             '116',
+            '99',
         ]
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
@@ -262,6 +270,7 @@ class MyDataset(torch.utils.data.Dataset):
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
             )
 
+        feat_statistics['99'] = 2
         return feat_default_value, feat_types, feat_statistics
 
     def fill_missing_feat(self, feat, item_id):
@@ -614,7 +623,7 @@ def load_mm_emb(mm_path, feat_ids):
     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
         shape = SHAPE_DICT[feat_id]
         emb_dict = {}
-        if feat_id == '81':
+        if feat_id != '81':
             try:
                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
                 for json_file in base_path.glob('*'):
@@ -628,7 +637,7 @@ def load_mm_emb(mm_path, feat_ids):
                             emb_dict.update(data_dict)
             except Exception as e:
                 print(f"transfer error: {e}")
-        if feat_id != '81':
+        if feat_id == '81':
             with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
                 emb_dict = pickle.load(f)
         mm_emb_dict[feat_id] = emb_dict

@@ -11,4 +11,4 @@ export TRAIN_CKPT_PATH="/home/lucasheng/Tencent/ckpt/"
 # cd ${RUNTIME_SCRIPT_DIR}
 
 # write your code below
-python -u main.py --hidden_units 128 --num_blocks 4 --num_heads 4 --l2_emb 0.1 --num_epochs 4 --use_hstu_attn --sample_neg_num 2 --use_all_in_batch --batch_size 16
+python -u main.py --hidden_units 128 --num_blocks 4 --num_heads 4 --l2_emb 0.1 --num_epochs 4 --use_hstu_attn --sample_neg_num 2 --use_all_in_batch --batch_size 16 --skip_mm_emb

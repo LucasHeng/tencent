@@ -62,16 +62,18 @@ def get_args():
     parser.add_argument('--concat_ua', action='store_false')
     parser.add_argument('--use_all_in_batch', action='store_true')
     parser.add_argument('--sample_neg_num',  default=1, type=int)
+    parser.add_argument('--skip_mm_emb', action='store_true')
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
+    
 
     args = parser.parse_args()
 
     return args
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':   
     set_seed(42)
     Path(os.environ.get('TRAIN_LOG_PATH')).mkdir(parents=True, exist_ok=True)
     Path(os.environ.get('TRAIN_TF_EVENTS_PATH')).mkdir(parents=True, exist_ok=True)
@@ -96,7 +98,7 @@ if __name__ == '__main__':
 
     for name, param in model.named_parameters():
         try:
-            torch.nn.init.xavier_normal_(param.data)
+            torch.nn.init.kaiming_normal_(param.data)
         except Exception:
             pass
 
