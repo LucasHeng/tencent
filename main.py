@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dataset import MyDataset
+from dataset import MyDataset, worker_init_fn
 from model import BaselineModel
 from InfoNCE import InfoNCE
 import random
@@ -25,12 +25,12 @@ def set_seed(seed=42, deterministic=True):
         torch.backends.cudnn.benchmark = False
     print(f"Random seed set as {seed}")
 
-def worker_init_fn(worker_id):
+# def worker_init_fn(worker_id):
     
-    # 设置当前worker的所有随机种子
-    torch.manual_seed(42)
-    np.random.seed(42)
-    random.seed(42)
+#     # 设置当前worker的所有随机种子
+#     torch.manual_seed(42)
+#     np.random.seed(42)
+#     random.seed(42)
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -81,15 +81,15 @@ if __name__ == '__main__':
 
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0,  worker_init_fn=worker_init_fn, generator=g, collate_fn=dataset.collate_fn
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=9,  worker_init_fn=worker_init_fn, generator=g, collate_fn=dataset.collate_fn
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn
     )
     usernum, itemnum = dataset.usernum, dataset.itemnum
-    feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
+    feat_statistics, item_feat_types, user_feat_types, add_feat_types = dataset.feat_statistics, dataset.item_feat_types, dataset.user_feat_types , dataset.add_feat_types
 
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = BaselineModel(usernum, itemnum, feat_statistics, item_feat_types,user_feat_types, add_feat_types, args).to(args.device)
 
     for name, param in model.named_parameters():
         try:
@@ -129,12 +129,12 @@ if __name__ == '__main__':
         if args.inference_only:
             break
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
-            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, user_feat = batch
             seq = seq.to(args.device)
             pos = pos.to(args.device)
             neg = neg.to(args.device)
             log_feats, pos_embs, neg_embs = model(
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, user_feat
             )
 
             optimizer.zero_grad()
@@ -184,12 +184,12 @@ if __name__ == '__main__':
         valid_Top10_acc_sum = 0
         with torch.no_grad():
             for step, batch in tqdm(enumerate(valid_loader), total=len(valid_loader)):
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
+                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, user_feat = batch
                 seq = seq.to(args.device)
                 pos = pos.to(args.device)
                 neg = neg.to(args.device)
                 log_feats, pos_embs, neg_embs  = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, user_feat
                 )
                 indices = np.where(next_token_type == 1)
                 if not args.use_all_in_batch:

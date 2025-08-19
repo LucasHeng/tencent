@@ -126,6 +126,7 @@ def get_candidate_emb(indexer, feat_types, feat_default_value, mm_emb_dict, mode
                 else:
                     feature[feat_id] = np.zeros(EMB_SHAPE_DICT[feat_id], dtype=np.float32)
 
+            feature['99'] = 2 # hit
             item_ids.append(item_id)
             creative_ids.append(creative_id)
             retrieval_ids.append(retrieval_id)
@@ -147,8 +148,8 @@ def infer():
         test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
-    feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
-    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    feat_statistics, feat_types, add_feat_types = test_dataset.feat_statistics, test_dataset.feature_types, test_dataset.add_feat_types
+    model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, add_feat_types, args).to(args.device)
     model.eval()
 
     ckpt_path = get_ckpt_path()

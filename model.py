@@ -197,7 +197,7 @@ class BaselineModel(torch.nn.Module):
         itemdnn: 物品特征拼接后经过的全连接层
     """
 
-    def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
+    def __init__(self, user_num, item_num, feat_statistics, item_feat_types, user_feat_types, add_feat_types, args):  #
         super(BaselineModel, self).__init__()
 
         self.user_num = user_num
@@ -220,7 +220,7 @@ class BaselineModel(torch.nn.Module):
         self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
 
-        self._init_feat_info(feat_statistics, feat_types)
+        self._init_feat_info(feat_statistics, item_feat_types, user_feat_types, add_feat_types)
 
         # 用户id对应的嵌入向量 + 稀疏特征对应的嵌入向量 + 数组特征对应的嵌入向量
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
@@ -233,8 +233,11 @@ class BaselineModel(torch.nn.Module):
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
+        print(f'itemdim {itemdim}')
+
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
+        self.inputdnn = torch.nn.Linear(2*args.hidden_units, args.hidden_units)
 
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
 
@@ -268,23 +271,30 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
+        for k in self.ITEM_MANUAL_FEAT:
+            self.sparse_emb[k] = torch.nn.Embedding(self.ITEM_MANUAL_FEAT[k] + 1, args.hidden_units, padding_idx=0)
 
-    def _init_feat_info(self, feat_statistics, feat_types):
+    def _init_feat_info(self, feat_statistics, item_feat_types, user_feat_types, add_feat_types):
         """
         将特征统计信息（特征数量）按特征类型分组产生不同的字典，方便声明稀疏特征的Embedding Table
 
         Args:
             feat_statistics: 特征统计信息，key为特征ID，value为特征数量
             feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
+            add_feat_types: 新增的的特征类型，key为特征类型名称，value为包含的特征ID列表
         """
-        self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['user_sparse']}
-        self.USER_CONTINUAL_FEAT = feat_types['user_continual']
-        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in feat_types['item_sparse']}
-        self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']
-        self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}
-        self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}
+        self.USER_SPARSE_FEAT = {k: feat_statistics[k] for k in user_feat_types['user_sparse']}
+        self.USER_CONTINUAL_FEAT = user_feat_types['user_continual']
+        self.ITEM_SPARSE_FEAT = {k: feat_statistics[k] for k in item_feat_types['item_sparse']}
+        self.ITEM_CONTINUAL_FEAT = item_feat_types['item_continual']
+        self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in user_feat_types['user_array']}
+        self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in item_feat_types['item_array']}
+        self.ITEM_MANUAL_FEAT = {k:feat_statistics[k] for k in add_feat_types['item_manual']}
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
-        self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
+        self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in item_feat_types['item_emb']}  # 记录的是不同多模态特征的维度
+        self.item_feat_types = [item for sublist in item_feat_types.values() for item in sublist]
+        self.user_feat_types = [item for sublist in user_feat_types.values() for item in sublist]
+        self.add_feat_types =  [item for sublist in add_feat_types.values() for item in sublist]
 
     def feat2tensor(self, seq_feature, k):
         """
@@ -297,41 +307,74 @@ class BaselineModel(torch.nn.Module):
         """
         batch_size = len(seq_feature)
 
-        # 处理某一个特征, 如果是array类型
-        if k in self.ITEM_ARRAY_FEAT or k in self.USER_ARRAY_FEAT:
-            # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
-            # 序列长度最大值, 这个特征数组的最长值
-            max_array_len = 0
-            max_seq_len = 0
+        if k in self.item_feat_types or k in self.add_feat_types:
+            # 处理某一个特征, 如果是array类型
+            # print(f'process {k}')
+            if k in self.ITEM_ARRAY_FEAT:
+                # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
+                # 序列长度最大值, 这个特征数组的最长值
+                max_array_len = 0
+                max_seq_len = 0
 
-            # 每一个item是一个用户的序列
-            for i in range(batch_size):
-                # 取其中某个feat的特征序列
-                seq_data = [item[k] for item in seq_feature[i]]
-                max_seq_len = max(max_seq_len, len(seq_data))
-                max_array_len = max(max_array_len, max(len(item_data) for item_data in seq_data))
+                # 每一个item是一个用户的序列
+                for i in range(batch_size):
+                    # 取其中某个feat的特征序列
+                    seq_data = [item[k] for item in seq_feature[i]]
+                    max_seq_len = max(max_seq_len, len(seq_data))
+                    max_array_len = max(max_array_len, max(len(item_data) for item_data in seq_data))
 
-            batch_data = np.zeros((batch_size, max_seq_len, max_array_len), dtype=np.int64)
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                for j, item_data in enumerate(seq_data):
+                batch_data = np.zeros((batch_size, max_seq_len, max_array_len), dtype=np.int64)
+                for i in range(batch_size):
+                    seq_data = [item[k] for item in seq_feature[i]]
+                    for j, item_data in enumerate(seq_data):
+                        actual_len = min(len(item_data), max_array_len)
+                        batch_data[i, j, :actual_len] = item_data[:actual_len]
+                # 后面补充为0
+
+                return torch.from_numpy(batch_data).to(self.dev)
+            else:
+                # 如果特征是Sparse类型，直接转换为tensor
+                max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
+                batch_data = np.zeros((batch_size, max_seq_len), dtype=np.int64)
+
+                for i in range(batch_size):
+                    seq_data = [item[k] for item in seq_feature[i]]
+                    batch_data[i] = seq_data
+            return torch.from_numpy(batch_data).to(self.dev)
+        elif k in self.user_feat_types:
+            # 处理某一个特征, 如果是array类型
+            # print(f"processing {k}")
+            if k in self.USER_ARRAY_FEAT:
+                # 如果特征是Array类型，需要先对array进行padding，然后转换为tensor
+                # 序列长度最大值, 这个特征数组的最长值
+                max_array_len = 0
+                max_seq_len = 0
+
+                # 每一个item是一个用户的序列
+                for i in range(batch_size):
+                    # 取其中某个feat的特征序列
+                    max_array_len = max(max_array_len, len(seq_feature[i][k]))
+
+                batch_data = np.zeros((batch_size, max_array_len), dtype=np.int64)
+                for i in range(batch_size):
+                    item_data = seq_feature[i][k]
                     actual_len = min(len(item_data), max_array_len)
-                    batch_data[i, j, :actual_len] = item_data[:actual_len]
-            # 后面补充为0
+                    batch_data[i, :actual_len] = item_data[:actual_len]
+                # 后面补充为0
+                return torch.from_numpy(batch_data).to(self.dev)
+            else:
+                # 如果特征是Sparse类型，直接转换为tensor
+                batch_data = np.zeros((batch_size), dtype=np.int64)
+
+                for i in range(batch_size):
+                    seq_data =  seq_feature[i][k]
+                    # if k == '99':
+                    #     print(f'seq_data: {i} {k} {seq_data}')
+                    batch_data[i] = seq_data
 
             return torch.from_numpy(batch_data).to(self.dev)
-        else:
-            # 如果特征是Sparse类型，直接转换为tensor
-            max_seq_len = max(len(seq_feature[i]) for i in range(batch_size))
-            batch_data = np.zeros((batch_size, max_seq_len), dtype=np.int64)
 
-            for i in range(batch_size):
-                seq_data = [item[k] for item in seq_feature[i]]
-                batch_data[i] = seq_data
-
-            return torch.from_numpy(batch_data).to(self.dev)
-
-    def feat2emb(self, seq, feature_array, mask=None, include_user=False):
+    def feat2emb(self, seq, feature_array, user_feat=None, mask=None, include_user=False):
         """
         Args:
             seq: 序列ID
@@ -345,10 +388,11 @@ class BaselineModel(torch.nn.Module):
         seq = seq.to(self.dev)
         # pre-compute embedding
         if include_user:
-            user_mask = (mask == 2).to(self.dev)
+            user_mask = np.where(mask == 2)
+            # user_mask = (mask == 2).to(self.dev)
             item_mask = (mask == 1).to(self.dev)
             # [batch_size, seq_len]
-            user_embedding = self.user_emb(user_mask * seq)
+            user_embedding = self.user_emb(seq[user_mask])
             item_embedding = self.item_emb(item_mask * seq)
             item_feat_list = [item_embedding]
             user_feat_list = [user_embedding]
@@ -363,17 +407,40 @@ class BaselineModel(torch.nn.Module):
             (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
             (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list),
         ]
-
+        user_feat_types = []
         if include_user:
-            all_feat_types.extend(
+            user_feat_types.extend(
                 [
                     (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
                     (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
                     (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
                 ]
             )
+            all_feat_types.extend(
+                [(self.ITEM_MANUAL_FEAT, 'item_manual', item_feat_list),]
+            )
 
+        add_feat_list = []
         # batch-process each feature type
+        for feat_dict, feat_type, feat_list in user_feat_types:
+            if not feat_dict:
+                continue
+
+            for k in feat_dict:
+                tensor_feature = self.feat2tensor(user_feat, k)
+                # print(f'item_shape {k} {tensor_feature.shape}')
+
+                # [batch_size, max_len] -> [batch_size, max_len, emb_dim]
+                if feat_type.endswith('sparse'):
+                    feat_list.append(self.sparse_emb[k](tensor_feature))
+                # [batch_size, max_len, ndim] -> [batch_size, max_len, ndim, emb_dim]
+                # 对嵌入得到的进行聚合
+                elif feat_type.endswith('array'):
+                    feat_list.append(self.sparse_emb[k](tensor_feature).sum(1))
+                # [batch_size, max_len] -> [batch_size, max_len, 1]
+                elif feat_type.endswith('continual'):
+                    feat_list.append(tensor_feature.unsqueeze(2))
+
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict:
                 continue
@@ -391,6 +458,8 @@ class BaselineModel(torch.nn.Module):
                 # [batch_size, max_len] -> [batch_size, max_len, 1]
                 elif feat_type.endswith('continual'):
                     feat_list.append(tensor_feature.unsqueeze(2))
+                elif feat_type.endswith('manual'):
+                    add_feat_list.append(self.sparse_emb[k](tensor_feature))
 
         for k in self.ITEM_EMB_FEAT:
             # collect all data to numpy, then batch-convert
@@ -414,17 +483,28 @@ class BaselineModel(torch.nn.Module):
         # merge features
         # 总的feature向量 [batch_size, feature_dim]
         all_item_emb = torch.cat(item_feat_list, dim=2)
+        # print(f'all_item_emb.shape: {all_item_emb.shape}')
         all_item_emb = F.silu(self.itemdnn(all_item_emb))
         if include_user:
-            all_user_emb = torch.cat(user_feat_list, dim=2)
+            # print(f'item_shape {[item.shape for item in user_feat_list]}')
+            all_user_emb = torch.cat(user_feat_list, dim=1)
             all_user_emb = F.silu(self.userdnn(all_user_emb))
-            seqs_emb = all_item_emb + all_user_emb
+            # 初始化[N,M,D]的全零矩阵
+            result = torch.zeros_like(all_item_emb, dtype=all_item_emb.dtype)
+            
+            # 找到mask中所有值为1的位置（返回两个一维数组：行索引和列索引）
+            rows, cols = np.where(mask == 1)
+            result[rows, cols] = all_user_emb[rows]
+            all_input_emb = torch.cat([all_item_emb, add_feat_list[0]], dim=-1)
+            result_input = F.silu(self.inputdnn(all_input_emb))
+
+            seqs_emb = result_input + result
         else:
             seqs_emb = all_item_emb
         # [batch_size, maxlen, hidden_unit]
         return seqs_emb
 
-    def log2feats(self, log_seqs, mask, seq_feature):
+    def log2feats(self, log_seqs, mask, seq_feature, user_feat):
         """
         Args:
             log_seqs: 序列ID
@@ -437,7 +517,7 @@ class BaselineModel(torch.nn.Module):
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
         # [batch_size, maxlen, hidden_unit]
-        seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
+        seqs = self.feat2emb(log_seqs, seq_feature, user_feat=user_feat, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= log_seqs != 0
@@ -488,7 +568,7 @@ class BaselineModel(torch.nn.Module):
         return mask_expanded
         
     def forward(
-        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
+        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature, user_feat
     ):
         """
         训练时调用，计算正负样本的logits
@@ -509,7 +589,7 @@ class BaselineModel(torch.nn.Module):
             neg_logits: 负样本logits，形状为 [batch_size, maxlen]
         """
         # [batch_size, max_len, hidden_uinit]
-        log_feats = self.log2feats(user_item, mask, seq_feature)
+        log_feats = self.log2feats(user_item, mask, seq_feature, user_feat)
         loss_mask = (next_mask == 1).to(self.dev)
 
         # [batch_size,  max_len, hidden_uinit]
@@ -533,7 +613,7 @@ class BaselineModel(torch.nn.Module):
         # pos_logits = pos_logits * loss_mask
         # neg_logits = neg_logits * loss_mask
         # 这个log_feats不应该乘log
-        print(f'pos_embs {pos_embs.shape} loss_mask {loss_mask.shape}')
+        # print(f'pos_embs {pos_embs.shape} loss_mask {loss_mask.shape}')
         loss_mask = loss_mask.unsqueeze(-1)
         pos_embs = pos_embs * loss_mask
         
