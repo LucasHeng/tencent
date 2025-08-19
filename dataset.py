@@ -48,10 +48,12 @@ class MyDataset(torch.utils.data.Dataset):
             indexer = pickle.load(ff)
             self.itemnum = len(indexer['i'])
             self.usernum = len(indexer['u'])
+            # print(f'itemnum {self.itemnum} and usernum {self.usernum}')
         # itemid 与 reconstruct id
         self.indexer_i_rev = {v: k for k, v in indexer['i'].items()}
         self.indexer_u_rev = {v: k for k, v in indexer['u'].items()}
         self.indexer = indexer
+        self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
 
@@ -59,9 +61,16 @@ class MyDataset(torch.utils.data.Dataset):
         """
         加载用户序列数据和每一行的文件偏移量(预处理好的), 用于快速随机访问数据并I/O
         """
-        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
+        # 仅记录路径，避免在主进程持有打开的文件描述符（便于多worker安全地各自打开）
+        self._data_file_path = self.data_dir / "seq.jsonl"
+        self.data_file = None
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
+
+    def _ensure_data_file_open(self):
+        # 在每个worker内懒加载独立的文件句柄，避免文件指针冲突
+        if getattr(self, 'data_file', None) is None:
+            self.data_file = open(self._data_file_path, 'rb')
 
     def _load_user_data(self, uid):
         """
@@ -73,12 +82,27 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
+        self._ensure_data_file_open()
         self.data_file.seek(self.seq_offsets[uid])
         line = self.data_file.readline()
         data = json.loads(line)
         return data
 
-    def _random_neq(self, l, r, s):
+    def __getstate__(self):
+        # 使Dataset可pickle：去掉不可pickle的文件对象，由worker进程内再懒加载
+        state = self.__dict__.copy()
+        state['data_file'] = None
+        return state
+
+    def __del__(self):
+        # 防御式关闭（不会在多worker生命周期内共享）
+        try:
+            if getattr(self, 'data_file', None) is not None:
+                self.data_file.close()
+        except Exception:
+            pass
+
+    def _random_neq(self, l, r, s,neg_num=1):
         """
         生成一个不在序列s中的随机整数, 用于训练时的负采样
 
@@ -90,10 +114,13 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             t: 不在序列s中的随机整数
         """
-        t = np.random.randint(l, r)
-        while t in s or str(t) not in self.item_feat_dict:
+        neg_samps = []
+        for i in range(neg_num):
             t = np.random.randint(l, r)
-        return t
+            while t in s or str(t) not in self.item_feat_dict:
+                t = np.random.randint(l, r)
+            neg_samps.append(t)
+        return neg_samps
 
     def __getitem__(self, uid):
         """
@@ -124,14 +151,14 @@ class MyDataset(torch.utils.data.Dataset):
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
-        neg = np.zeros([self.maxlen + 1], dtype=np.int32)
+        neg = np.zeros([self.maxlen + 1, self.sample_neg_num], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         next_action_type = np.zeros([self.maxlen + 1], dtype=np.int32)
 
         seq_feat = np.empty([self.maxlen + 1], dtype=object)
         pos_feat = np.empty([self.maxlen + 1], dtype=object)
-        neg_feat = np.empty([self.maxlen + 1], dtype=object)
+        neg_feat = np.empty([self.maxlen + 1, self.sample_neg_num], dtype=object)
 
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
@@ -156,9 +183,10 @@ class MyDataset(torch.utils.data.Dataset):
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
-                neg_id = self._random_neq(1, self.itemnum + 1, ts)
-                neg[idx] = neg_id
-                neg_feat[idx] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                neg_ids = self._random_neq(1, self.itemnum + 1, ts, self.sample_neg_num)
+                neg[idx] = neg_ids
+                for id,neg_id in enumerate(neg_ids):
+                    neg_feat[idx][id] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
             nxt = record_tuple
             idx -= 1
             if idx == -1:
@@ -266,8 +294,7 @@ class MyDataset(torch.utils.data.Dataset):
 
         return filled_feat
 
-    @staticmethod
-    def collate_fn(batch):
+    def collate_fn(self, batch):
         """
         Args:
             batch: 多个__getitem__返回的数据
@@ -289,10 +316,143 @@ class MyDataset(torch.utils.data.Dataset):
         token_type = torch.from_numpy(np.array(token_type))
         next_token_type = torch.from_numpy(np.array(next_token_type))
         next_action_type = torch.from_numpy(np.array(next_action_type))
-        seq_feat = list(seq_feat)
-        pos_feat = list(pos_feat)
-        neg_feat = list(neg_feat)
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+
+        # helpers
+        B = len(seq_feat)
+        L = len(seq_feat[0]) if B > 0 else 0
+
+        def build_dense(feat_ids, batch_list, dtype='int'):
+            if dtype == 'int':
+                out = {k: np.array([[sample[t][k] for t in range(L)] for sample in batch_list], dtype=np.int64) for k in feat_ids}
+            elif dtype == 'float':
+                out = {k: np.array([[sample[t][k] for t in range(L)] for sample in batch_list], dtype=np.float32) for k in feat_ids}
+            else:
+                out = {}
+            return out
+
+        def build_array(feat_ids, batch_list):
+            out = {}
+            for k in feat_ids:
+                max_a = 1
+                for sample in batch_list:
+                    for t in range(L):
+                        v = sample[t][k]
+                        if isinstance(v, list):
+                            if len(v) > max_a:
+                                max_a = len(v)
+                arr = np.zeros((B, L, max_a), dtype=np.int64)
+                for b, sample in enumerate(batch_list):
+                    for t in range(L):
+                        v = sample[t][k]
+                        if isinstance(v, list) and len(v) > 0:
+                            a = min(len(v), max_a)
+                            arr[b, t, :a] = np.asarray(v[:a], dtype=np.int64)
+                out[k] = arr
+            return out
+
+        def build_emb(feat_ids, batch_list):
+            out = {}
+            for k in feat_ids:
+                dim = self.feature_default_value[k].shape[0]
+                arr = np.zeros((B, L, dim), dtype=np.float32)
+                for b, sample in enumerate(batch_list):
+                    for t in range(L):
+                        v = sample[t][k]
+                        if isinstance(v, np.ndarray) and v.size > 0:
+                            arr[b, t] = v
+                out[k] = arr
+            return out
+
+        seq_feat_list = list(seq_feat)
+        pos_feat_list = list(pos_feat)
+        neg_feat_list = list(neg_feat)
+
+        # pack seq & pos features using known feature id groups
+        seq_feat_pre = {}
+        pos_feat_pre = {}
+        # item sparse/continual
+        seq_feat_pre.update(build_dense(self.feature_types['item_sparse'], seq_feat_list, 'int'))
+        pos_feat_pre.update(build_dense(self.feature_types['item_sparse'], pos_feat_list, 'int'))
+        seq_feat_pre.update(build_dense(self.feature_types['item_continual'], seq_feat_list, 'float'))
+        pos_feat_pre.update(build_dense(self.feature_types['item_continual'], pos_feat_list, 'float'))
+        # user sparse/continual
+        seq_feat_pre.update(build_dense(self.feature_types['user_sparse'], seq_feat_list, 'int'))
+        seq_feat_pre.update(build_dense(self.feature_types['user_continual'], seq_feat_list, 'float'))
+        # arrays
+        seq_feat_pre.update(build_array(self.feature_types['item_array'], seq_feat_list))
+        pos_feat_pre.update(build_array(self.feature_types['item_array'], pos_feat_list))
+        seq_feat_pre.update(build_array(self.feature_types['user_array'], seq_feat_list))
+        # multimodal emb
+        seq_feat_pre.update(build_emb(self.feature_types['item_emb'], seq_feat_list))
+        pos_feat_pre.update(build_emb(self.feature_types['item_emb'], pos_feat_list))
+
+        # pack negatives: shapes -> sparse/continual [B, L, K], array [B, L, K, A], emb [B, L, K, E]
+        K = neg.shape[-1]
+
+        def build_dense_neg(feat_ids, batch_list, dtype='int'):
+            if dtype == 'int':
+                arrs = {}
+                for k in feat_ids:
+                    arr = np.zeros((B, L, K), dtype=np.int64)
+                    for b, sample in enumerate(batch_list):
+                        for t in range(L):
+                            for n in range(K):
+                                arr[b, t, n] = sample[t][n][k]
+                    arrs[k] = arr
+                return arrs
+            else:
+                arrs = {}
+                for k in feat_ids:
+                    arr = np.zeros((B, L, K), dtype=np.float32)
+                    for b, sample in enumerate(batch_list):
+                        for t in range(L):
+                            for n in range(K):
+                                arr[b, t, n] = float(sample[t][n][k])
+                    arrs[k] = arr
+                return arrs
+
+        def build_array_neg(feat_ids, batch_list):
+            arrs = {}
+            for k in feat_ids:
+                max_a = 1
+                for sample in batch_list:
+                    for t in range(L):
+                        for n in range(K):
+                            v = sample[t][n][k]
+                            if isinstance(v, list) and len(v) > max_a:
+                                max_a = len(v)
+                arr = np.zeros((B, L, K, max_a), dtype=np.int64)
+                for b, sample in enumerate(batch_list):
+                    for t in range(L):
+                        for n in range(K):
+                            v = sample[t][n][k]
+                            if isinstance(v, list) and len(v) > 0:
+                                a = min(len(v), max_a)
+                                arr[b, t, n, :a] = np.asarray(v[:a], dtype=np.int64)
+                arrs[k] = arr
+            return arrs
+
+        def build_emb_neg(feat_ids, batch_list):
+            arrs = {}
+            for k in feat_ids:
+                dim = self.feature_default_value[k].shape[0]
+                arr = np.zeros((B, L, K, dim), dtype=np.float32)
+                for b, sample in enumerate(batch_list):
+                    for t in range(L):
+                        for n in range(K):
+                            v = sample[t][n][k]
+                            if isinstance(v, np.ndarray) and v.size > 0:
+                                arr[b, t, n] = v
+                arrs[k] = arr
+            return arrs
+
+        neg_feat_pre = {}
+        neg_feat_pre.update(build_dense_neg(self.feature_types['item_sparse'], neg_feat_list, 'int'))
+        neg_feat_pre.update(build_dense_neg(self.feature_types['item_continual'], neg_feat_list, 'float'))
+        neg_feat_pre.update(build_array_neg(self.feature_types['item_array'], neg_feat_list))
+        neg_feat_pre.update(build_emb_neg(self.feature_types['item_emb'], neg_feat_list))
+
+        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat_pre, pos_feat_pre, neg_feat_pre
 
 
 class MyTestDataset(MyDataset):
@@ -304,7 +464,8 @@ class MyTestDataset(MyDataset):
         super().__init__(data_dir, args)
 
     def _load_data_and_offsets(self):
-        self.data_file = open(self.data_dir / "predict_seq.jsonl", 'rb')
+        self._data_file_path = self.data_dir / "predict_seq.jsonl"
+        self.data_file = None
         with open(Path(self.data_dir, 'predict_seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
 
@@ -453,7 +614,7 @@ def load_mm_emb(mm_path, feat_ids):
     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
         shape = SHAPE_DICT[feat_id]
         emb_dict = {}
-        if feat_id != '81':
+        if feat_id == '81':
             try:
                 base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
                 for json_file in base_path.glob('*'):
@@ -467,7 +628,7 @@ def load_mm_emb(mm_path, feat_ids):
                             emb_dict.update(data_dict)
             except Exception as e:
                 print(f"transfer error: {e}")
-        if feat_id == '81':
+        if feat_id != '81':
             with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
                 emb_dict = pickle.load(f)
         mm_emb_dict[feat_id] = emb_dict
