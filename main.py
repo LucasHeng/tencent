@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
 
 from dataset import MyDataset
 from model import BaselineModel
@@ -86,19 +87,22 @@ if __name__ == '__main__':
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker, persistent_workers=True, pin_memory=True,
     )
     valid_loader = DataLoader(
-        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker
+        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker, persistent_workers=True, pin_memory=True,
     )
     usernum, itemnum = dataset.usernum, dataset.itemnum
     feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
 
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
+    model = model.cuda()
+    optimizer = torch.optim.Adam(model.parameters())
+    scaler = GradScaler()  # 梯度缩放器，防止 FP16 下溢
 
     for name, param in model.named_parameters():
         try:
-            torch.nn.init.kaiming_normal_(param.data)
+            torch.nn.init.xavier_normal_(param.data)
         except Exception:
             pass
 
@@ -128,6 +132,7 @@ if __name__ == '__main__':
     best_test_ndcg, best_test_hr = 0.0, 0.0
     T = 0.0
     t0 = time.time()
+    pre_t = time.time()
     global_step = 0
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         model.train()
@@ -138,20 +143,22 @@ if __name__ == '__main__':
             seq = seq.to(args.device)
             pos = pos.to(args.device)
             neg = neg.to(args.device)
-            log_feats, pos_embs, neg_embs = model(
-                seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
-            )
-
             optimizer.zero_grad()
-            indices = np.where(next_token_type == 1)
-            if not args.use_all_in_batch:
-                loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
-            else:
-                pos_mask = model.posmask(pos)
-                x_index,y_index = indices
-                selected_masks = pos_mask[indices]
-                loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
-
+            t1 = time.time()
+            with autocast():
+                log_feats, pos_embs, neg_embs = model(
+                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+                )
+                t2 = time.time()
+                indices = np.where(next_token_type == 1)
+                if not args.use_all_in_batch:
+                    loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+                else:
+                    pos_mask = model.posmask(pos)
+                    x_index,y_index = indices
+                    selected_masks = pos_mask[indices]
+                    loss, acc, pos_sim, neg_sim, Top10_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
+            t3 = time.time()
             elapsed_str = _format_elapsed(time.time() - t0)
             log_json = json.dumps(
                 {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str},
@@ -171,15 +178,22 @@ if __name__ == '__main__':
 
             for param in model.item_emb.parameters():
                 loss += args.l2_emb * torch.norm(param)
-            loss.backward()
-
+            t4 = time.time()
+            scaler.scale(loss).backward()
+            
             total_norm = 0
             for p in model.parameters():
                 if p.grad is not None:
                     param_norm = p.grad.data.norm(2)  # L2 范数
                     total_norm += param_norm.item() ** 2
             writer.add_scalar(f'Grad Norm', total_norm, step)
-            optimizer.step()
+            t5 = time.time()
+            scaler.step(optimizer)
+            scaler.update()
+            t6 = time.time()
+            total = t6 - pre_t
+            print(f'total time: {total:.3f}s load time:{t1-pre_t:.3f}s {(t1-pre_t)/total:.3f} train time: {t2-t1:.2f}s {(t2-t1)/total:.3f}, forward time: {t3-t2:.3f}s {(t3-t2)/total:.3f}, backward time: {t5-t4:.3f}s {(t5-t4)/total:.3f}, optimizer time: {t6-t5:.3f}s {(t6-t5)/total:.3f}')
+            pre_t = t6
             # print(f"Train Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
             # print(f"Train Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
