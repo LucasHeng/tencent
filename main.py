@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LinearLR
+
 
 from dataset import MyDataset
 from model import BaselineModel
@@ -127,6 +129,7 @@ if __name__ == '__main__':
 
     infonce_criterion = InfoNCE(temperature=0.07, reduction='mean')
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=1000)
 
     best_val_ndcg, best_val_hr = 0.0, 0.0
     best_test_ndcg, best_test_hr = 0.0, 0.0
@@ -181,15 +184,20 @@ if __name__ == '__main__':
             t4 = time.time()
             scaler.scale(loss).backward()
             
-            total_norm = 0
+            total_norm = 0.0
             for p in model.parameters():
                 if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)  # L2 范数
-                    total_norm += param_norm.item() ** 2
+                    # 真实梯度 = 放大梯度 / scale
+                    real_grad = p.grad.data.float() / scaler.get_scale()
+                    param_norm = real_grad.norm().item() ** 2
+                    total_norm += param_norm
+            total_norm = total_norm ** 0.5
+
             writer.add_scalar(f'Grad Norm', total_norm, step)
             t5 = time.time()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
             t6 = time.time()
             total = t6 - pre_t
             print(f'total time: {total:.3f}s load time:{t1-pre_t:.3f}s {(t1-pre_t)/total:.3f} train time: {t2-t1:.2f}s {(t2-t1)/total:.3f}, forward time: {t3-t2:.3f}s {(t3-t2)/total:.3f}, backward time: {t5-t4:.3f}s {(t5-t4)/total:.3f}, optimizer time: {t6-t5:.3f}s {(t6-t5)/total:.3f}')
