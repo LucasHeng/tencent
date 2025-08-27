@@ -3,10 +3,100 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from tqdm import tqdm
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import math
+
 from dataset import save_emb
+
+def apply_rope(x, timestamps, dim, base=10000):
+    """Apply Rotary Position Embedding (RoPE) based on time differences.
+    Args:
+        x: Input tensor of shape [batch_size, seq_len, num_heads, dim]
+        timestamps: Timestamp tensor of shape [batch_size, seq_len]
+        dim: Dimension of the embedding
+        base: Base for frequency calculation
+    Returns:
+        Tensor with RoPE applied based on time differences
+    """
+    device = x.device
+    dtype = x.dtype
+    B, seq_len, num_heads, dim = x.shape
+    
+    # Normalize timestamps to prevent numerical instability
+    # Convert to relative timestamps (time differences from the first timestamp)
+    timestamps_min = timestamps.min(dim=1, keepdim=True)[0]  # [B, 1] - extract values from min result
+    timestamps_normalized = timestamps - timestamps_min  # [B, seq_len]
+    
+    # Scale timestamps to a reasonable range (e.g., 0 to 1000)
+    # This prevents very large values from causing numerical issues
+    timestamps_max = timestamps_normalized.max(dim=1, keepdim=True)[0]  # [B, 1] - extract values from max result
+    timestamps_scaled = timestamps_normalized / (timestamps_max.clamp(min=1e-6) + 1e-6) * 1000
+    
+    # Create frequency bands
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device, dtype=dtype) * -(math.log(base) / dim))
+    
+    # Split x into even and odd indices
+    x_even = x[..., ::2]  # [B, seq_len, num_heads, dim//2]
+    x_odd = x[..., 1::2]  # [B, seq_len, num_heads, dim//2]
+    
+    # Apply rotation based on normalized and scaled timestamps
+    timestamps_expanded = timestamps_scaled.unsqueeze(-1).unsqueeze(-1)  # [B, seq_len, 1, 1]
+    sin_ts = torch.sin(timestamps_expanded * div_term)  # [B, seq_len, 1, dim//2]
+    cos_ts = torch.cos(timestamps_expanded * div_term)  # [B, seq_len, 1, dim//2]
+    
+    # Apply rotation
+    rotated_even = x_even * cos_ts - x_odd * sin_ts
+    rotated_odd = x_even * sin_ts + x_odd * cos_ts
+    
+    # Reconstruct the tensor
+    result = torch.zeros_like(x)
+    result[..., ::2] = rotated_even
+    result[..., 1::2] = rotated_odd
+    
+    return result
+
+class SENETLayer(nn.Module):
+    """SENETLayer used in FiBiNET.
+      Input shape
+        - A list of 3D tensor with shape: ``(batch_size,filed_size,embedding_size)``.
+      Output shape
+        - A list of 3D tensor with shape: ``(batch_size,filed_size,embedding_size)``.
+      Arguments
+        - **filed_size** : Positive integer, number of feature groups.
+        - **reduction_ratio** : Positive integer, dimensionality of the
+         attention network output space.
+        - **seed** : A Python integer to use as random seed.
+      References
+        - [FiBiNET: Combining Feature Importance and Bilinear feature Interaction for Click-Through Rate Prediction
+Tongwen](https://arxiv.org/pdf/1905.09433.pdf)
+    """
+
+    def __init__(self, filed_size, reduction_ratio=3, seed=1024, device='cpu'):
+        super(SENETLayer, self).__init__()
+        self.seed = seed
+        self.filed_size = filed_size
+        self.reduction_size = max(1, filed_size // reduction_ratio)
+        self.excitation = nn.Sequential(
+            nn.Linear(self.filed_size, self.reduction_size, bias=False),
+            nn.ReLU(),
+            nn.Linear(self.reduction_size, self.filed_size, bias=False),
+            nn.ReLU()
+        )
+        self.to(device)
+
+    def forward(self, inputs):
+        if len(inputs.shape) != 3:
+            raise ValueError(
+                "Unexpected inputs dimensions %d, expect to be 3 dimensions" % (len(inputs.shape)))
+        Z = torch.mean(inputs, dim=-1, out=None)
+        A = self.excitation(Z)
+        V = torch.mul(inputs, torch.unsqueeze(A, dim=2))
+
+        return V
+
 
 class RelativeBucketedTimeAndPositionBasedBias(torch.nn.Module):
     """
@@ -82,21 +172,33 @@ def _hstu_attention_maybe_from_cache(
 ):
     B, _, n, _ = attention_mask.size()
 
+    # Reshape q, k, v for attention computation
+    q_reshaped = q.view(B, n, num_heads, attention_dim)
+    k_reshaped = k.view(B, n, num_heads, attention_dim)
+    v_reshaped = v.view(B, n, num_heads, linear_dim)
+    
+    # Apply time-based RoPE to q and k
+    q_rope = apply_rope(q_reshaped, all_timestamps, attention_dim)
+    k_rope = apply_rope(k_reshaped, all_timestamps, attention_dim)
+
+    # Compute attention scores with time-aware rotations
     qk_attn = torch.einsum(
         "bnhd,bmhd->bhnm",
-        q.view(B, n, num_heads, attention_dim),
-        k.view(B, n, num_heads, attention_dim),
+        q_rope,
+        k_rope,
     )
     
+    # Add relative attention bias (if any)
     qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
 
     qk_attn = F.silu(qk_attn) / n
     qk_attn = qk_attn * attention_mask
-    # print(f"{qk_attn.size() = } {v.size() = }")
+    
+    # Apply attention to values
     attn_output = torch.einsum(
         "bhnm,bmhd->bnhd",
         qk_attn,
-        v.reshape(B, n, num_heads, linear_dim),
+        v_reshaped,
     ).reshape(B, n, num_heads * linear_dim)
     return attn_output
 
@@ -410,7 +512,7 @@ class BaselineModel(torch.nn.Module):
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
-        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+        self.pos_emb = torch.nn.Embedding(2*args.maxlen + 1, args.hidden_units, padding_idx=0)
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
@@ -432,6 +534,12 @@ class BaselineModel(torch.nn.Module):
             + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
+
+        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT))
+        itemsenet_dim =  (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT)) + len(self.ITEM_EMB_FEAT)
+
+        self.senet_user = SENETLayer(filed_size=usersenet_dim, reduction_ratio=3, seed=42, device=args.device)
+        self.senet_item = SENETLayer(filed_size=itemsenet_dim, reduction_ratio=3, seed=42, device=args.device)
 
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
@@ -592,11 +700,20 @@ class BaselineModel(torch.nn.Module):
 
         # merge features
         # 总的feature向量 [batch_size, feature_dim]
-        all_item_emb = torch.cat(item_feat_list, dim=2)
-        all_item_emb = F.silu(self.itemdnn(all_item_emb))
+        batch_size = seq.size(0)
+        seq_len = seq.size(1)
+        all_item_emb = torch.stack(item_feat_list, dim=2)
+        all_item_emb = all_item_emb.view(batch_size*seq_len, -1, all_item_emb.shape[-1])
+        all_item_emb = self.senet_item(all_item_emb)
+        all_item_emb = all_item_emb.view(batch_size, seq_len, -1)
+        all_item_emb = self.itemdnn(all_item_emb)
+        
         if include_user:
-            all_user_emb = torch.cat(user_feat_list, dim=2)
-            all_user_emb = F.silu(self.userdnn(all_user_emb))
+            all_user_emb = torch.stack(user_feat_list, dim=2)
+            all_user_emb = all_user_emb.view(batch_size*seq_len, -1, all_user_emb.shape[-1])
+            all_user_emb = self.senet_user(all_user_emb)
+            all_user_emb = all_user_emb.view(batch_size, seq_len, -1)
+            all_user_emb = self.userdnn(all_user_emb)
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
@@ -625,11 +742,16 @@ class BaselineModel(torch.nn.Module):
         seqs = self.emb_dropout(seqs)
 
         maxlen = seqs.shape[1]
-        ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
-        attention_mask_tril = torch.tril(ones_matrix)
+        
+        # 优化attention mask计算：缓存tril矩阵，避免重复计算
+        if not hasattr(self, '_cached_tril') or self._cached_tril.size(0) != maxlen:
+            # 只在序列长度变化时重新计算tril矩阵
+            ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
+            self._cached_tril = torch.tril(ones_matrix)
+        
         attention_mask_pad = (mask != 0).to(self.dev)
         # [1, maxlen, maxlen] & [batch_size, 1, maxlen] -> [batch_size, maxlen, maxlen] 然后保留下三角
-        attention_mask = attention_mask_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
+        attention_mask = self._cached_tril.unsqueeze(0) & attention_mask_pad.unsqueeze(1)
 
         seq_timestamp = seq_timestamp.to(self.dev)
         for i in range(len(self.attention_layers)):
@@ -637,9 +759,9 @@ class BaselineModel(torch.nn.Module):
                 x = self.attention_layernorms[i](seqs)
                 mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask, all_timestamps=seq_timestamp)
                 seqs = seqs + mha_outputs
-                # seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
+                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask, all_timestamps=seq_timestamp)
+                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
                 seqs = self.attention_layernorms[i](seqs + mha_outputs)
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
@@ -734,7 +856,7 @@ class BaselineModel(torch.nn.Module):
         neg_embs = neg_embs.reshape(-1, neg_embs.shape[-1])
         return log_feats, pos_embs, neg_embs
 
-    def predict(self, log_seqs, seq_feature, mask):
+    def predict(self, log_seqs, seq_feature, mask, seq_timestamp):
         """
         计算用户序列的表征
         Args:
@@ -744,7 +866,7 @@ class BaselineModel(torch.nn.Module):
         Returns:
             final_feat: 用户序列的表征，形状为 [batch_size, hidden_units]
         """
-        log_feats = self.log2feats(log_seqs, mask, seq_feature)
+        log_feats = self.log2feats(log_seqs, mask, seq_feature, seq_timestamp)
 
         final_feat = log_feats[:, -1, :]
 

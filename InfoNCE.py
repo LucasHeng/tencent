@@ -48,7 +48,7 @@ class InfoNCE(nn.Module):
         >>> output = loss(query, positive_key, negative_keys)
     """
 
-    def __init__(self, temperature=0.01, reduction='mean'):
+    def __init__(self, temperature, reduction='mean'):
         super().__init__()
         self.temperature = temperature
         self.reduction = reduction
@@ -61,110 +61,39 @@ class InfoNCE(nn.Module):
 
 
 def info_nce(query, positive_key, negative_keys=None, next_action_type=None, temperature=0.1, reduction='mean', negative_mode='unpaired', pos_mask=None):
-    # Check input dimensionality.
-    if query.dim() != 2:
-        raise ValueError('<query> must have 2 dimensions.')
-    if positive_key.dim() != 2:
-        raise ValueError('<positive_key> must have 2 dimensions.')
-    # if negative_keys is not None:
-        # if negative_mode == 'unpaired' and negative_keys.dim() != 2:
-        # #     raise ValueError("<negative_keys> must have 2 dimensions if <negative_mode> == 'unpaired'.")
-        # if negative_mode == 'paired' and negative_keys.dim() != 3:
-        #     raise ValueError("<negative_keys> must have 3 dimensions if <negative_mode> == 'paired'.")
-
-    # Check matching number of samples.
-    if len(query) != len(positive_key):
-        raise ValueError('<query> and <positive_key> must must have the same number of samples.')
-    if negative_keys is not None:
-        if negative_mode == 'paired' and len(query) != len(negative_keys):
-            raise ValueError("If negative_mode == 'paired', then <negative_keys> must have the same number of samples as <query>.")
-
-    # Embedding vectors should have same number of components.
-    if query.shape[-1] != positive_key.shape[-1]:
-        raise ValueError('Vectors of <query> and <positive_key> should have the same number of components.')
-    if negative_keys is not None:
-        if query.shape[-1] != negative_keys.shape[-1]:
-            raise ValueError('Vectors of <query> and <negative_keys> should have the same number of components.')
-
-    # Normalize to unit vectors
-    query, positive_key, negative_keys = normalize(query, positive_key, negative_keys)
+    # L2归一化
+    target_dtype = query.dtype
+    
     if next_action_type is not None:
         next_action_type = next_action_type.reshape(-1)
-        hit_pos = torch.where(next_action_type==1)[0]    
+        hit_pos = torch.where(next_action_type==1)[0]       
         if (len(next_action_type) != len(query)):
                 raise ValueError(f'Vectors of <next_action_type> {len(next_action_type)} and <query> {len(query)} should have the same number of components.')
         
+
+    # 转换positive_key到相同类型
+    if positive_key.dtype != target_dtype:
+        positive_key = positive_key.to(target_dtype)
+    
+    # 转换negative_keys到相同类型（如果存在）
+    if negative_keys is not None and negative_keys.dtype != target_dtype:
+        negative_keys = negative_keys.to(target_dtype)
+
+    query, positive_key, negative_keys = normalize(query, positive_key, negative_keys)
+    
     S = query.shape[0]
-    if negative_keys is not None:
-        # Explicit negative keys
+    positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
+    negative_keys = negative_keys.reshape(-1, negative_keys.shape[-1])
+    negative_logits = query @ transpose(negative_keys)
 
-        # Cosine between positive pairs
-        positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
+    # First index in last dimension are the positive samples
+    logits = torch.cat([positive_logit, negative_logits], dim=1)
+    if next_action_type is not None:
+        logits[hit_pos, 0] *= 1.5
+    labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
+    diag_mean = positive_logit.mean()
+    non_diag_mean = negative_logits.mean()
 
-        if negative_mode == 'unpaired':
-            # Cosine between all query-negative combinations
-            # [bs,d] [bs , d, n]
-            print(f'positive_logit {query.shape} negative_logits {negative_keys.shape}')
-            negative_keys = negative_keys.reshape(-1, negative_keys.shape[-1])
-            negative_logits = query @ transpose(negative_keys)
-
-        elif negative_mode == 'paired':
-            query = query.unsqueeze(1)
-            negative_logits = query @ transpose(negative_keys)
-            negative_logits = negative_logits.squeeze(1)
-
-        negative_logits
-        # First index in last dimension are the positive samples
-        logits = torch.cat([positive_logit, negative_logits], dim=1)
-        if next_action_type is not None:
-            logits[hit_pos, 0] *= 1.5
-        labels = torch.zeros(len(logits), dtype=torch.long, device=query.device)
-        diag_mean = positive_logit.mean()
-        non_diag_mean = negative_logits.mean()
-    else:
-        # Negative keys are implicitly off-diagonal positive keys.
-
-        # Cosine between all combinations
-        #[batch_size*max_len, batch_size*max_len]
-        # [S, D]
-        # [1, S, D] [S, 1, D]
-        # device = query.device
-        
-        # 假设特征已归一化，计算positive_key之间的点积（[S, S]）
-
-        # key_dot = torch.matmul(positive_key, positive_key.t())  # 等价于余弦相似度（归一化后）
-        
-        # # 完全相同的特征点积为1（考虑数值误差，用eps判断）
-        # same_mask = torch.isclose(key_dot, torch.tensor(1.0, device=device), atol=1e-6)
-        
-        # # 排除自身
-        # mask = same_mask & ~torch.eye(S, dtype=torch.bool, device=device)
-        
-        # 计算logits并应用掩码
-        logits = query @ transpose(positive_key)
-        
-        # Positive keys are the entries on the diagonal
-        labels = torch.arange(len(query), device=query.device)
-        diag_mask = torch.eye(S, dtype=torch.bool, device=logits.device)
-        
-        if pos_mask is not None:
-            filter_mask = pos_mask & ~diag_mask
-            logits[filter_mask] = -1e18
-        
-        # [S, S]
-        if next_action_type is not None:
-            logits[hit_pos, hit_pos] *= 1.5
-
-
-        # 3. 对角线有效元素：对角线且有效
-        diag_valid_mask = diag_mask
-        diag_elements = logits[diag_valid_mask]
-        diag_mean = diag_elements.mean() if diag_elements.numel() > 0 else torch.tensor(0.0, device=logits.device)
-        # 4. 非对角线有效元素：非对角线且有效
-        non_diag_valid_mask = ~diag_mask & ~pos_mask
-        non_diag_elements = logits[non_diag_valid_mask]
-        non_diag_mean = non_diag_elements.mean() if non_diag_elements.numel() > 0 else torch.tensor(0.0, device=logits.device)
-        
     K = 10
     _, topk_indices = torch.topk(logits, k=K, dim=1)  # [S, k]
     expanded_labels = labels.view(-1, 1).expand_as(topk_indices)  # [S, k]
