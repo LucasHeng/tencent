@@ -626,18 +626,20 @@ class BaselineModel(torch.nn.Module):
 
         raise ValueError("feature_array must be a packed dict from collate_fn. Old list-of-dicts format is no longer supported.")
 
-    def feat2emb(self, seq, feature_array, mask=None, include_user=False):
+    def feat2emb(self, seq, feature_array, mask=None, include_user=False, timestamps=None):
         """
         Args:
             seq: 序列ID
             feature_array: 特征list，每个元素为当前时刻的特征字典
             mask: 掩码，1表示item，2表示user
             include_user: 是否处理用户特征，在两种情况下不打开：1) 训练时在转换正负样本的特征时（因为正负样本都是item）;2) 生成候选库item embedding时。
+            timestamps: 序列时间戳，形状为 [batch_size, seq_len] （可选）
 
         Returns:
             seqs_emb: 序列特征的Embedding
         """
         seq = seq.to(self.dev)
+        
         # pre-compute embedding
         if include_user:
             user_mask = (mask == 2).to(self.dev)
@@ -651,14 +653,13 @@ class BaselineModel(torch.nn.Module):
             # [batch_size, embed_dim]
             item_embedding = self.item_emb(seq)
             item_feat_list = [item_embedding]
-
+        
         # batch-process all feature types
         all_feat_types = [
             (self.ITEM_SPARSE_FEAT, 'item_sparse', item_feat_list),
             (self.ITEM_ARRAY_FEAT, 'item_array', item_feat_list),
             (self.ITEM_CONTINUAL_FEAT, 'item_continual', item_feat_list),
         ]
-
         if include_user:
             all_feat_types.extend(
                 [
@@ -667,26 +668,22 @@ class BaselineModel(torch.nn.Module):
                     (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
                 ]
             )
-
+        
         # batch-process each feature type
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict:
                 continue
-
             for k in feat_dict:
                 tensor_feature = self.feat2tensor(feature_array, k)
-
-                # [batch_size, max_len] -> [batch_size, max_len, emb_dim]
                 if feat_type.endswith('sparse'):
                     feat_list.append(self.sparse_emb[k](tensor_feature))
-                # [batch_size, max_len, ndim] -> [batch_size, max_len, ndim, emb_dim]
-                # 对嵌入得到的进行聚合
                 elif feat_type.endswith('array'):
                     feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
-                # [batch_size, max_len] -> [batch_size, max_len, 1]
                 elif feat_type.endswith('continual'):
                     feat_list.append(tensor_feature.unsqueeze(2))
-
+        
+        # 时间特征改为由dataset提供，这里不再追加
+        
         for k in self.ITEM_EMB_FEAT:
             # dataset已预处理为按特征聚合的数组：直接使用
             if not isinstance(feature_array, dict) or k not in feature_array:
@@ -697,7 +694,7 @@ class BaselineModel(torch.nn.Module):
             else:
                 tensor_feature = torch.from_numpy(pre).to(self.dev)
             item_feat_list.append(self.emb_transform[k](tensor_feature))
-
+        
         # merge features
         # 总的feature向量 [batch_size, feature_dim]
         batch_size = seq.size(0)
@@ -733,7 +730,7 @@ class BaselineModel(torch.nn.Module):
         batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
         # [batch_size, maxlen, hidden_unit]
-        seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
+        seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True, timestamps=seq_timestamp)
         seqs *= self.item_emb.embedding_dim**0.5
         poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         poss *= log_seqs != 0

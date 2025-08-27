@@ -59,6 +59,22 @@ class MyDataset(torch.utils.data.Dataset):
         self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
+        # 统计时间间隔分桶：类别0为padding，1为零间隔，2..为各边界桶
+        try:
+            self._tdelta_bucket_counts = np.zeros(int(self._safe_feat_stat('1304')) + 1, dtype=np.int64)
+        except Exception:
+            self._tdelta_bucket_counts = np.zeros(32, dtype=np.int64)
+        self._tdelta_total = 0
+
+    def _safe_feat_stat(self, k):
+        return self._get_feat_stat(self._ensure_feat_stats(), k)
+
+    def _ensure_feat_stats(self):
+        return getattr(self, 'feat_statistics', {})
+
+    @staticmethod
+    def _get_feat_stat(stat_dict, k):
+        return stat_dict[k] if isinstance(stat_dict, dict) and k in stat_dict else 0
 
     def _load_data_and_offsets(self):
         """
@@ -184,20 +200,68 @@ class MyDataset(torch.utils.data.Dataset):
             next_token_type[idx] = next_type
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
+            # 构造时间特征并写入稀疏特征（整数类别）
+            hour = int((timestamp // 3600) % 24) if timestamp > 0 else 0
+            weekday = int(((timestamp // 86400) + 4) % 7) if timestamp > 0 else 0
+            month = int(((timestamp // (86400 * 30)) % 12) + 1) if timestamp > 0 else 0
+            # 1304(时间差分桶)稍后统一根据“当前-前一条”的时间差回填
+            feat['1301'] = month  # 已为1..12，缺失为0
+            feat['1302'] = (weekday + 1) if timestamp > 0 else 0  # 1..7
+            feat['1303'] = (hour + 1) if timestamp > 0 else 0      # 1..24
+            feat['1304'] = 0  # 先置0，占位，循环结束后回填正确分桶
             seq_feat[idx] = feat
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
+                # pos时间特征使用默认值（不显式赋值）
                 pos_feat[idx] = next_feat
                 neg_ids = self._random_neq(1, self.itemnum + 1, ts, self.sample_neg_num)
                 neg[idx] = neg_ids
                 for id,neg_id in enumerate(neg_ids):
-                    neg_feat[idx][id] = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                    nf = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                    # neg时间特征使用默认值（不显式赋值）
+                    neg_feat[idx][id] = nf
             nxt = record_tuple
             idx -= 1
             if idx == -1:
                 break
 
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
+        # 回填1304：使用“当前-前一条”的时间差，按固定边界分桶（前密后疏），非零分桶+1；首位为0
+        # 前密后疏，尾部压缩到14天后一桶
+        edges = np.array([
+            30, 60, 120, 300, 600, 900, 1800,
+            3600, 7200, 14400, 28800,
+            43200, 64800, 86400, 129600, 172800,
+            259200, 432000, 604800, 1209600
+        ], dtype=np.int64)
+        # 仅对item位置计算“当前item-上一个item”的时间差；user位置置0
+        ts_np = seq_timestamp
+        tt_np = token_type
+        last_item_ts = 0
+        for t in range(len(seq_feat)):
+            cat = 0
+            if tt_np[t] == 1 and ts_np[t] > 0:
+                # 第一个 item（last_item_ts==0）归入 padding 桶0
+                if last_item_ts == 0:
+                    cat = 0
+                else:
+                    delta = max(int(ts_np[t]) - int(last_item_ts), 0)
+                    if delta == 0:
+                        # 真实零间隔单独编码为1，避免与padding混淆
+                        cat = 1
+                    else:
+                        idx_edge = np.searchsorted(edges, delta, side='right')
+                        cat = idx_edge + 2  # 1为零间隔，2..为边界桶
+                last_item_ts = ts_np[t]
+            if isinstance(seq_feat[t], dict):
+                seq_feat[t]['1304'] = int(cat)
+                # 统计：仅对item间隔计数（cat>0为有效间隔）
+                if tt_np[t] == 1 and cat >= 0:
+                    # 计数：包含padding(0)、零间隔(1)、其余(2..)
+                    idx = int(cat)
+                    if idx < self._tdelta_bucket_counts.shape[0]:
+                        self._tdelta_bucket_counts[idx] += 1
+                    self._tdelta_total += 1
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
         neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
 
@@ -211,6 +275,22 @@ class MyDataset(torch.utils.data.Dataset):
             usernum: 用户数量
         """
         return len(self.seq_offsets)
+
+    def report_time_delta_hist(self):
+        """
+        打印时间间隔分桶的频率统计（占比）。
+        0: padding/首个item；1: 真实零间隔；2..: 固定边界桶。
+        """
+        if getattr(self, '_tdelta_total', 0) == 0:
+            print('[time-delta] no samples counted yet')
+            return
+        total = max(1, int(self._tdelta_total))
+        counts = self._tdelta_bucket_counts[:]
+        # 输出前若干桶的占比
+        print('[time-delta] bucket ratios:')
+        for i, c in enumerate(counts):
+            ratio = float(c) / total
+            print(f'  bucket {i}: count={int(c)} ratio={ratio:.6f}')
 
     def _init_feat_info(self):
         """
@@ -244,7 +324,11 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
         feat_types['user_continual'] = []
+        # 连续型特征
         feat_types['item_continual'] = []
+        # 将时间特征改为稀疏特征（整数类别），使用数字型特征ID
+        # 约定：1301-月份，1302-星期，1303-小时，1304-时间差分桶
+        feat_types['item_sparse'].extend(['1301', '1302', '1303', '1304'])
 
         for feat_id in feat_types['user_sparse']:
             feat_default_value[feat_id] = 0
@@ -262,6 +346,16 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = 0
         for feat_id in feat_types['item_continual']:
             feat_default_value[feat_id] = 0
+        # 为新增稀疏时间特征设置默认值与词表大小（数值型ID）
+        feat_default_value['1301'] = 0
+        feat_default_value['1302'] = 0
+        feat_default_value['1303'] = 0
+        feat_default_value['1304'] = 0
+        feat_statistics['1301'] = 12
+        feat_statistics['1302'] = 7
+        feat_statistics['1303'] = 24
+        # t_delta 使用固定边界分桶：非零桶 = 1(零间隔) + len(edges)；当前 edges=20 → 非零桶=21（+0 padding）
+        feat_statistics['1304'] = 21
         for feat_id in feat_types['item_emb']:
             feat_default_value[feat_id] = np.zeros(
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
@@ -544,13 +638,29 @@ class MyTestDataset(MyDataset):
             if record_tuple[2] == 1 and record_tuple[0]:
                 ts.add(record_tuple[0])
 
+        prev_timestamp = None
         for record_tuple in reversed(ext_user_sequence[:]):
             i, feat, type_,timestamp = record_tuple
             feat = self.fill_missing_feat(feat, i)
+            # 添加时间稀疏特征（与训练集一致，保留0作为padding）
+            hour = int((timestamp // 3600) % 24) if timestamp > 0 else 0
+            weekday = int(((timestamp // 86400) + 4) % 7) if timestamp > 0 else 0
+            month = int(((timestamp // (86400 * 30)) % 12) + 1) if timestamp > 0 else 0
+            # 与前一个已填入位置的时间差（当前 - 前一个），若无前一个则为0
+            if prev_timestamp is not None and timestamp > 0:
+                raw_delta = max(timestamp - prev_timestamp, 0)
+            else:
+                raw_delta = 0
+            delta_bucket = int(min(15, np.floor(np.log2(raw_delta + 1))))
+            feat['1301'] = month
+            feat['1302'] = (weekday + 1) if timestamp > 0 else 0
+            feat['1303'] = (hour + 1) if timestamp > 0 else 0
+            feat['1304'] = (delta_bucket + 1) if raw_delta > 0 else 0
             seq[idx] = i
             seq_timestamp[idx] = timestamp
             token_type[idx] = type_
             seq_feat[idx] = feat
+            prev_timestamp = timestamp
             idx -= 1
             if idx == -1:
                 break
