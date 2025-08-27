@@ -172,36 +172,6 @@ def info_nce(query, positive_key, negative_keys=None, next_action_type=None, tem
     correct_topk = correct.any(dim=1)  # [S]
     accuracy = correct_topk.float().mean() * 100.0
 
-    # # 10个命中率
-    # # 生成列索引偏移：0, 1, ..., k-1（形状为[1, k]）
-    # col_indices = torch.arange(K, device=query.device).view(1, -1)  # 形状 [1, k]
-    
-    # # 生成行起始索引：0, 1, ..., s-1（形状为[s, 1]）
-    # row_starts = torch.arange(S, device=query.device).view(-1, 1)  # 形状 [s, 1]
-    
-    # # 计算原始矩阵：每行 = 行起始索引 + 列偏移（形状 [s,S k]）
-    # raw_matrix = row_starts + col_indices
-    
-    # # 创建掩码：标记所有大于等于s的元素（超出有效范围）
-    # mask = raw_matrix >= S
-    
-    # # 超出范围的元素置为-1
-    # matrix = raw_matrix.masked_fill(mask, -1)
-    # # 扩展matrix为[S, K, 1]，便于与B的每行进行广播比较
-    # matrix_expanded = matrix.unsqueeze(2)  # 形状 [S, K, 1]
-    
-    # # 扩展B为[S, 1, K]，便于与matrix的每个元素比较
-    # topk_indices = topk_indices.unsqueeze(1)  # 形状 [S, 1, K]
-    # # 逐元素比较：matrix[i][j]与B[i]的所有元素是否相等 → 形状 [S, K, K]
-    # # 然后按最后一维取any，判断是否存在至少一个相等 → 形状 [S, K]
-    # duplicate_mask = (matrix_expanded == topk_indices).any(dim=2)
-    # total_duplicates = duplicate_mask.sum().item()
-    # # 计算矩阵的总元素数量
-    # total_elements = duplicate_mask.numel()  # numel() 返回张量中元素的总数
-    
-    # # 计算平均值（重复率）
-    # duplicate_mean = total_duplicates / total_elements if total_elements != 0 else 0.0
-
     return F.cross_entropy(logits / temperature, labels, reduction=reduction), accuracy, diag_mean, non_diag_mean, 0
 
 
