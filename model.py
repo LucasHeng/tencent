@@ -421,7 +421,7 @@ class FlashMultiHeadAttention(torch.nn.Module):
         self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
         self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
 
-    def forward(self, query, key, value, attn_mask=None):
+    def forward(self, query, key, value, attn_mask=None, all_timestamps=None):
         batch_size, seq_len, _ = query.size()
 
         # 计算Q, K, V
@@ -525,9 +525,9 @@ class BaselineModel(torch.nn.Module):
         self._init_feat_info(feat_statistics, feat_types)
 
         # 用户id对应的嵌入向量 + 稀疏特征对应的嵌入向量 + 数组特征对应的嵌入向量
-        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + len(
             self.USER_CONTINUAL_FEAT
-        )
+        ))
         # (商品id对应的嵌入向量 + 稀疏特征对应的嵌入向量 +      ) + 连续特征 + 多模态的embeding特征转换的嵌入向量 
         itemdim = (
             args.hidden_units * (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT))
@@ -535,13 +535,13 @@ class BaselineModel(torch.nn.Module):
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
-        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT))
+        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(self.USER_CONTINUAL_FEAT)
         itemsenet_dim =  (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT)) + len(self.ITEM_EMB_FEAT)
 
-        self.senet_user = SENETLayer(filed_size=usersenet_dim, reduction_ratio=3, seed=42, device=args.device)
+        self.senet_user = SENETLayer(filed_size=usersenet_dim + itemsenet_dim, reduction_ratio=3, seed=42, device=args.device)
         self.senet_item = SENETLayer(filed_size=itemsenet_dim, reduction_ratio=3, seed=42, device=args.device)
 
-        self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
+        self.userdnn = torch.nn.Linear(userdim + itemdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
 
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
@@ -584,6 +584,8 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
+        for k in self.USER_CONTINUAL_FEAT:
+            self.sparse_emb[k] = torch.nn.Linear(1, args.hidden_units)
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -680,7 +682,7 @@ class BaselineModel(torch.nn.Module):
                 elif feat_type.endswith('array'):
                     feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
                 elif feat_type.endswith('continual'):
-                    feat_list.append(tensor_feature.unsqueeze(2))
+                    feat_list.append(self.sparse_emb[k](tensor_feature.unsqueeze(2)))
         
         # 时间特征改为由dataset提供，这里不再追加
         
@@ -699,21 +701,21 @@ class BaselineModel(torch.nn.Module):
         # 总的feature向量 [batch_size, feature_dim]
         batch_size = seq.size(0)
         seq_len = seq.size(1)
-        all_item_emb = torch.stack(item_feat_list, dim=2)
-        all_item_emb = all_item_emb.view(batch_size*seq_len, -1, all_item_emb.shape[-1])
-        all_item_emb = self.senet_item(all_item_emb)
-        all_item_emb = all_item_emb.view(batch_size, seq_len, -1)
-        all_item_emb = self.itemdnn(all_item_emb)
+
         
         if include_user:
+            user_feat_list.extend(item_feat_list) 
             all_user_emb = torch.stack(user_feat_list, dim=2)
             all_user_emb = all_user_emb.view(batch_size*seq_len, -1, all_user_emb.shape[-1])
             all_user_emb = self.senet_user(all_user_emb)
             all_user_emb = all_user_emb.view(batch_size, seq_len, -1)
-            all_user_emb = self.userdnn(all_user_emb)
-            seqs_emb = all_item_emb + all_user_emb
+            seqs_emb = self.userdnn(all_user_emb)
         else:
-            seqs_emb = all_item_emb
+            all_item_emb = torch.stack(item_feat_list, dim=2)
+            all_item_emb = all_item_emb.view(batch_size*seq_len, -1, all_item_emb.shape[-1])
+            all_item_emb = self.senet_item(all_item_emb)
+            all_item_emb = all_item_emb.view(batch_size, seq_len, -1)
+            seqs_emb = self.itemdnn(all_item_emb)
         # [batch_size, maxlen, hidden_unit]
         return seqs_emb
 
@@ -758,7 +760,7 @@ class BaselineModel(torch.nn.Module):
                 seqs = seqs + mha_outputs
                 seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
+                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask, all_timestamps=seq_timestamp)
                 seqs = self.attention_layernorms[i](seqs + mha_outputs)
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 

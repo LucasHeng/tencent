@@ -86,7 +86,7 @@ def get_args():
 
     # Train params
     parser.add_argument('--batch_size', default=128, type=int)
-    parser.add_argument('--lr', default=0.001, type=float)
+    parser.add_argument('--lr', default=0.005, type=float)
     parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction
@@ -109,7 +109,7 @@ def get_args():
     # 性能优化参数
     parser.add_argument('--use_gradient_checkpointing', action='store_true', help='启用梯度检查点以减少内存占用')
     parser.add_argument('--compile_model', action='store_true', help='使用torch.compile优化模型')
-    parser.add_argument('--use_amp', action='store_false', default=True, help='使用混合精度训练')
+    parser.add_argument('--use_amp', action='store_true', default=False, help='使用混合精度训练')
     parser.add_argument('--optimize_backward', action='store_true', default=True, help='启用backward性能优化')
     parser.add_argument('--gradient_clip', default=1.0, type=float, help='梯度裁剪阈值')
     parser.add_argument('--grad_norm_freq', default=20, type=int, help='梯度范数计算频率（每N步计算一次）')
@@ -139,9 +139,10 @@ if __name__ == '__main__':
     writer = SummaryWriter(os.environ.get('TRAIN_TF_EVENTS_PATH'))
     # global dataset
     data_path = os.environ.get('TRAIN_DATA_PATH')
+    save_path = os.environ.get('USER_CACHE_PATH')
 
     args = get_args()
-    dataset = MyDataset(data_path, args)
+    dataset = MyDataset(data_path, args, save_path)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker, pin_memory=True,
@@ -263,7 +264,7 @@ if __name__ == '__main__':
             if step % args.log_freq == 0:
                 elapsed_str = _format_elapsed(time.time() - t0)
                 log_json = json.dumps(
-                    {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str, 'click_acc': future_click_acc.item()},
+                    {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str, 'click_acc': future_click_acc},
                     ensure_ascii=False,
                 )
                 log_file.write(log_json + '\n')
@@ -421,6 +422,7 @@ if __name__ == '__main__':
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / "model.pt")
 
+    dataset.save_statistics(save_path)
     print("Done")
     writer.close()
     log_file.close()
