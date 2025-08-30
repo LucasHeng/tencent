@@ -422,7 +422,6 @@ if __name__ == '__main__':
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / "model.pt")
 
-    dataset.save_statistics(save_path)
     print("Done")
     writer.close()
     log_file.close()

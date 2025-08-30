@@ -14,7 +14,21 @@ try:
 except Exception:
     _FCNTL_AVAILABLE = False
 
-
+import os
+def clear_directory(directory):
+    if not os.path.exists(directory):
+        print(f"目录不存在: {directory}")
+        return
+    
+    for filename in os.listdir(directory):
+        file_path = os.path.join(directory, filename)
+        try:
+            if os.path.isfile(file_path) or os.path.islink(file_path):
+                os.unlink(file_path)  # 删除文件或符号链接
+            elif os.path.isdir(file_path):
+                shutil.rmtree(file_path)  # 删除子目录
+        except Exception as e:
+            print(f"删除失败: {file_path}, 错误: {e}")
 class MyDataset(torch.utils.data.Dataset):
     """
     用户序列数据集
@@ -78,14 +92,13 @@ class MyDataset(torch.utils.data.Dataset):
 
         self.main_pid = os.getpid()  # 此时在主进程中执行，记录主进程 ID
         # 初始化全局统计信息
-        self.global_stats = {}
-        self._cumu_cache = {}  # 按item的累计缓存：{item_id: (timestamps[list], cum_clicks[np], cum_impr[np])}
+        global_stats = {}
         self._save_path = save_path  # 保存save_path以便后续使用
         
         # 设置训练标志，用于调试信息
         self._is_training = True
         
-        self._init_global_statistics(args, save_path)
+        self._init_global_statistics()
 
     def _safe_feat_stat(self, k):
         return getattr(self, 'feat_statistics', {}).get(k, 0)
@@ -141,21 +154,20 @@ class MyDataset(torch.utils.data.Dataset):
             return data
 
 
-    def save_statistics(self, save_path=None):
+    def save_statistics(self, global_stats):
         """
         仅在主进程持久化一次原始增量raw_stats；若存在同名文件则直接删除后重写。
         """
-        if not hasattr(self, 'global_stats') or not self.global_stats:
+        if not hasattr(self, 'global_stats') or not global_stats:
             return
-        if save_path is None:
-            save_path = getattr(self, '_save_path', self.data_dir)
-        save_dir = Path(save_path)
+
+        save_dir = Path(self._save_path)
         save_dir.mkdir(parents=True, exist_ok=True)
         stats_file = save_dir / 'global_statistics.pkl'
 
         if not (os.getpid() == self.main_pid):
             return
-
+        
         # 删除同名文件
         if stats_file.exists():
             try:
@@ -164,7 +176,7 @@ class MyDataset(torch.utils.data.Dataset):
                 pass
         
         # 保存统计信息
-        payload = {'raw': self.global_stats}
+        payload = {'raw': global_stats}
         with open(stats_file, 'wb') as f:
             pickle.dump(payload, f)
     
@@ -842,7 +854,7 @@ class MyDataset(torch.utils.data.Dataset):
             return {'clicks': 0, 'impressions': 0}
         return {'clicks': int(clicks_cumu[idx]), 'impressions': int(imprs_cumu[idx])}
 
-    def _init_global_statistics(self, args, save_path):
+    def _init_global_statistics(self):
         """
         初始化全局统计信息
         
@@ -850,59 +862,57 @@ class MyDataset(torch.utils.data.Dataset):
             args: 参数对象，包含统计信息相关配置
             save_path: 统计数据保存路径，如果为None则使用data_dir
         """
-        if save_path is None:
-            save_path = self.data_dir
-            print(f"save_path为None，使用默认路径: {save_path}")
+        save_path = self._save_path
+        print(f"save_path为None，使用默认路径: {save_path}")
 
         stats_file = Path(save_path) / "global_statistics.pkl"
 
         is_test_dataset = self.__class__.__name__ == 'MyTestDataset'
         is_primary = (os.getpid() == self.main_pid)
 
+        global_stats = {}
         if is_test_dataset:
             # 测试数据集：主进程加载训练统计->增量更新->再构建累计缓存；子进程只加载不构建，等待主进程完成
             if is_primary:
                 print(f"测试数据集模式：从 {save_path} 加载训练集统计信息")
                 if stats_file.exists():
                     print(f"加载训练集统计信息: {stats_file}")
-                    self.global_stats = self._load_global_statistics(stats_file, build_cache=False)
+                    global_stats = self._load_global_statistics(stats_file, build_cache=False)
                     # 遍历测试数据更新统计信息（仅内存），不重建缓存
                     self._update_statistics_from_test_data(save_path)
                     # 测试数据更新完成后统一构建累计缓存
-                    self._build_cumu_cache_from_raw(self.global_stats)
+                    self._build_cumu_cache_from_raw(global_stats)
                 else:
                     print(f"警告：训练集统计信息文件不存在 {stats_file}，将使用空统计信息")
-                    self.global_stats = {}
             else:
                 if stats_file.exists():
                     # 子进程只加载raw，不构建缓存（避免重复构建），等主进程更新后生效
-                    self.global_stats = self._load_global_statistics(stats_file, build_cache=False)
-                else:
-                    self.global_stats = {}
+                    global_stats = self._load_global_statistics(stats_file, build_cache=False)
         else:
             # 训练集：每次训练都重新构建统计信息
             if is_primary:
+                clear_directory(save_path)
                 # 删除现有统计文件
                 if stats_file.exists():
                     print(f"删除现有统计文件: {stats_file}")
                     stats_file.unlink()
-                
+
                 print("自动生成全局统计信息...")
-                self.global_stats = self._precompute_global_statistics(stats_file)
+                global_stats = self._precompute_global_statistics(stats_file)
+                self.save_statistics(global_stats)
             else:
                 # 子进程等待主进程生成完成后再加载
                 if stats_file.exists():
-                    self.global_stats = self._load_global_statistics(stats_file)
-                else:
-                    self.global_stats = {}
+                    global_stats = self._load_global_statistics(stats_file)
 
-        if self.global_stats:
-            print(f"全局统计信息初始化完成，包含 {len(self.global_stats)} 个item")
+
+        if global_stats:
+            print(f"全局统计信息初始化完成，包含 {len(global_stats)} 个item")
         else:
             print("警告：全局统计信息为空")
         
 
-    def _update_statistics_from_test_data(self, save_path):
+    def _update_statistics_from_test_data(self, save_path, global_stats):
         """
         从测试数据更新统计信息（仅内存，不持久化）
         
@@ -940,13 +950,13 @@ class MyDataset(torch.utils.data.Dataset):
                             evt_key = (int(u) if u is not None else 0, int(action_type))
                             # 直接更新统计信息，使用集合自动去重
                             # 写入raw增量，不排序不重建
-                            if item_id not in self.global_stats:
-                                self.global_stats[item_id] = {}
+                            if item_id not in global_stats:
+                                global_stats[item_id] = {}
                                 new_item_count += 1
-                            if timestamp not in self.global_stats[item_id]:
-                                self.global_stats[item_id][timestamp] = {'clicks': set(), 'impressions': set()}
+                            if timestamp not in global_stats[item_id]:
+                                global_stats[item_id][timestamp] = {'clicks': set(), 'impressions': set()}
                             
-                            inc = self.global_stats[item_id][timestamp]
+                            inc = global_stats[item_id][timestamp]
                             user_id = int(u) if u is not None else 0
                             if action_type == 1:
                                 inc['clicks'].add(user_id)
@@ -959,7 +969,7 @@ class MyDataset(torch.utils.data.Dataset):
                     continue
         
         # 为所有item重建累计缓存（因为之前没有构建）
-        self._build_cumu_cache_from_raw(self.global_stats)
+        self._build_cumu_cache_from_raw(global_stats)
         
         print(f"更新完成：更新了 {updated_count} 条事件，影响 {len(touched_items)} 个item（内存） 新增item {new_item_count}")
 
@@ -982,7 +992,7 @@ class MyTestDataset(MyDataset):
             save_path = self.data_dir
         
         # 测试集不再加载更新后的持久化文件，保持使用训练统计并在内存增量
-        # 保留原有self.global_stats（由父类加载的训练统计）
+        # 保留原有global_stats（由父类加载的训练统计）
 
     def _load_data_and_offsets(self):
         self._data_file_path = self.data_dir / "predict_seq.jsonl"
