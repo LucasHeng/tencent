@@ -80,7 +80,6 @@ class MyDataset(torch.utils.data.Dataset):
         # 初始化全局统计信息
         self.global_stats = {}
         self._cumu_cache = {}  # 按item的累计缓存：{item_id: (timestamps[list], cum_clicks[np], cum_impr[np])}
-        self._seen_events = {}  # 训练阶段已见事件：{item_id: {timestamp: set((user_id, action_type))}}
         self._save_path = save_path  # 保存save_path以便后续使用
         
         # 设置训练标志，用于调试信息
@@ -821,7 +820,6 @@ class MyDataset(torch.utils.data.Dataset):
         with open(load_path, 'rb') as f:
             payload = pickle.load(f)
         raw_stats = payload.get('raw', {})
-        self._seen_events = {}  # 不再需要seen_events
         if build_cache:
             self._build_cumu_cache_from_raw(raw_stats)
         
