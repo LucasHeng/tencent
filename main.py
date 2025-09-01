@@ -111,7 +111,7 @@ def get_args():
     parser.add_argument('--compile_model', action='store_true', help='使用torch.compile优化模型')
     parser.add_argument('--use_amp', action='store_true', default=False, help='使用混合精度训练')
     parser.add_argument('--optimize_backward', action='store_true', default=True, help='启用backward性能优化')
-    parser.add_argument('--gradient_clip', default=1.0, type=float, help='梯度裁剪阈值')
+    parser.add_argument('--gradient_clip', default=0.0, type=float, help='梯度裁剪阈值')
     parser.add_argument('--grad_norm_freq', default=20, type=int, help='梯度范数计算频率（每N步计算一次）')
     parser.add_argument('--log_freq', default=10, type=int, help='日志记录频率（每N步记录一次）')
     parser.add_argument('--print_freq', default=10, type=int, help='控制台打印频率（每N步打印一次）')
@@ -139,10 +139,11 @@ if __name__ == '__main__':
     writer = SummaryWriter(os.environ.get('TRAIN_TF_EVENTS_PATH'))
     # global dataset
     data_path = os.environ.get('TRAIN_DATA_PATH')
-    save_path = os.environ.get('USER_CACHE_PATH')
 
     args = get_args()
-    dataset = MyDataset(data_path, args, save_path)
+    args.save_path = os.environ.get('USER_CACHE_PATH')
+
+    dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker, pin_memory=True,
