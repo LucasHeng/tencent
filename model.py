@@ -525,7 +525,7 @@ class BaselineModel(torch.nn.Module):
         self._init_feat_info(feat_statistics, feat_types)
 
         # 用户id对应的嵌入向量 + 稀疏特征对应的嵌入向量 + 数组特征对应的嵌入向量
-        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + len(self.USER_STATS_ARRAY)) + len(
             self.USER_CONTINUAL_FEAT
         )
         # (商品id对应的嵌入向量 + 稀疏特征对应的嵌入向量 +      ) + 连续特征 + 多模态的embeding特征转换的嵌入向量 
@@ -535,7 +535,7 @@ class BaselineModel(torch.nn.Module):
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
-        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT))
+        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(self.USER_STATS_ARRAY)
         itemsenet_dim =  (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT)) + len(self.ITEM_EMB_FEAT)
 
         self.senet_user = SENETLayer(filed_size=usersenet_dim + itemsenet_dim, reduction_ratio=3, seed=42, device=args.device)
@@ -667,9 +667,11 @@ class BaselineModel(torch.nn.Module):
                     (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
                     (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
                     (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
+                    (self.USER_STATS_ARRAY, 'user_stats_array', user_feat_list),
                 ]
             )
         
+        continue_feat_list = []
         # batch-process each feature type
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict:
@@ -678,10 +680,12 @@ class BaselineModel(torch.nn.Module):
                 tensor_feature = self.feat2tensor(feature_array, k)
                 if feat_type.endswith('sparse'):
                     feat_list.append(self.sparse_emb[k](tensor_feature))
+                elif feat_type.endswith('user_stats_array'):
+                    feat_list.append(self.user_emb(tensor_feature).sum(2))
                 elif feat_type.endswith('array'):
-                    feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
+                    feat_list.append(self.sparse_emb[k](tensor_feature ).sum(2))
                 elif feat_type.endswith('continual'):
-                    feat_list.append(tensor_feature.unsqueeze(2))
+                    continue_feat_list.append(tensor_feature.unsqueeze(2))
         
         # 时间特征改为由dataset提供，这里不再追加
         
@@ -708,6 +712,7 @@ class BaselineModel(torch.nn.Module):
             all_user_emb = all_user_emb.view(batch_size*seq_len, -1, all_user_emb.shape[-1])
             all_user_emb = self.senet_user(all_user_emb)
             all_user_emb = all_user_emb.view(batch_size, seq_len, -1)
+            all_user_emb = torch.cat([all_user_emb, torch.cat(continue_feat_list, dim=2)], dim=2)
             seqs_emb = self.userdnn(all_user_emb)
         else:
             all_item_emb = torch.stack(item_feat_list, dim=2)

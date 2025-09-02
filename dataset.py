@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from collections import defaultdict, Counter
+import psutil
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -61,6 +62,8 @@ class MyDataset(torch.utils.data.Dataset):
         self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
+        print(f'self.feature_types {self.feature_types}')
+        print(f'self.feat_statistics {self.feat_statistics}')
         # 统计时间间隔分桶：类别0为padding，1为零间隔，2..为各边界桶
         try:
             self._tdelta_bucket_counts = np.zeros(int(self._safe_feat_stat('1304')) + 1, dtype=np.int64)
@@ -74,6 +77,130 @@ class MyDataset(torch.utils.data.Dataset):
             43200, 64800, 86400, 129600, 172800,
             259200, 432000, 604800, 1209600
         ], dtype=np.int64)
+
+
+        if self.stats_file_path.exists() and self.offsets_file_path.exists():
+            print(f"发现新格式的统计信息文件: {self.stats_file_path}")
+            self._load_offsets()
+        else:
+            print("未发现缓存的统计信息，开始处理数据...")
+            self.process_data()
+        
+
+    def _load_offsets(self):
+        """
+        加载offset索引
+        """
+        if self.offsets_file_path and self.offsets_file_path.exists():
+            with open(self.offsets_file_path, 'rb') as f:
+                self.item_offsets = pickle.load(f)
+            print(f"已加载 {len(self.item_offsets)} 个item的offset索引")
+        else:
+            print("未找到offset索引文件")
+
+    def timestamp_to_hour_stamp(self, timestamp):
+        """
+        将时间戳转换为小时时间戳
+        
+        Args:
+            timestamp: Unix时间戳
+            
+        Returns:
+            hour_stamp: 小时时间戳（Unix时间戳向下取整到小时）
+        """
+        # 向下取整到小时
+        return (timestamp // 3600) * 3600
+
+    def process_data(self):
+        """
+        处理数据，构建按小时的统计信息并保存到文件
+        """
+        print("开始处理item统计信息...")
+        
+        # 加载数据
+        seq_file = self.data_dir / "seq.jsonl"
+        
+        # 临时存储统计信息（处理完成后写入文件）
+        temp_stats = defaultdict(lambda: defaultdict(lambda: {'exposure_users': [], 'click_users': []}))
+
+        # 流式处理数据，避免一次性加载所有记录到内存
+        record_count = 0
+        with open(seq_file, 'r') as f:
+            for line_num, line in enumerate(tqdm(f, desc="处理用户序列")):
+                user_sequence = json.loads(line.strip())
+                for record in user_sequence:
+                    user_id, item_id, user_feat, item_feat, action_type, timestamp = record
+                    if item_id is not None and user_id is not None:
+                        # 直接处理记录，不存储在内存中
+                        hour_stamp = self.timestamp_to_hour_stamp(timestamp)
+                        
+                        # 更新该小时的统计信息
+                        if user_id not in temp_stats[item_id][hour_stamp]['exposure_users']:
+                            temp_stats[item_id][hour_stamp]['exposure_users'].append(user_id)
+                        
+                        if action_type == 1:  # 点击
+                            if user_id not in temp_stats[item_id][hour_stamp]['click_users']:
+                                temp_stats[item_id][hour_stamp]['click_users'].append(user_id)
+                        
+                        record_count += 1
+                        
+        print(f"总记录数: {record_count}")
+        
+        # 将统计信息写入文件并创建offset索引
+        self._save_stats_to_file(temp_stats)
+        
+        # 清理临时数据
+        del temp_stats
+        
+        print(f"处理完成！")
+        
+        # 打印内存使用情况
+        memory_usage = self._get_memory_usage()
+        print(f"最终内存使用: {memory_usage:.2f}MB")
+
+    def _get_memory_usage(self):
+        """获取当前内存使用情况（MB）"""
+        try:
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            return memory_info.rss / 1024 / 1024
+        except:
+            return 0
+
+    def _save_stats_to_file(self, temp_stats):
+        """
+        将统计信息保存到文件并创建offset索引
+        """
+        print("将统计信息写入文件...")
+        self.item_offsets = {}
+        # 写入统计信息文件
+        with open(self.stats_file_path, 'w') as f:
+            for item_id, hours in tqdm(temp_stats.items(), desc="写入统计信息"):
+                # 记录当前item的offset
+                self.item_offsets[item_id] = f.tell()
+                
+                # 写入item的统计信息
+                item_data = {
+                    'item_id': item_id,
+                    'stats': {}
+                }
+                
+                for hour_stamp, stats in hours.items():
+                    item_data['stats'][str(hour_stamp)] = {
+                        'exposure_users': stats['exposure_users'],
+                        'click_users': stats['click_users']
+                    }
+                
+                f.write(json.dumps(item_data, ensure_ascii=False) + '\n')
+        
+        # 保存offset索引
+        with open(self.offsets_file_path, 'wb') as f:
+            pickle.dump(self.item_offsets, f)
+        
+        print(f"统计信息已保存到: {self.stats_file_path}")
+        print(f"Offset索引已保存到: {self.offsets_file_path}")
+        print(f"总item数: {len(self.item_offsets)}")
+
 
     def _safe_feat_stat(self, k):
         return self._get_feat_stat(self._ensure_feat_stats(), k)
@@ -95,10 +222,8 @@ class MyDataset(torch.utils.data.Dataset):
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
 
-        with open(Path(self.save_path, 'item_stats_offsets.pkl'), 'rb') as f:
-            self.item_offsets = pickle.load(f)
-        self.stats_file = None
         self.stats_file_path = Path(self.save_path) / "item_stats.jsonl"
+        self.offsets_file_path = Path(self.save_path) / "item_stats_offsets.pkl"
 
         
     def _ensure_data_file_open(self):
@@ -169,8 +294,8 @@ class MyDataset(torch.utils.data.Dataset):
         if item_id not in self.item_offsets:
             return None
         
-        # 延迟初始化文件句柄
-        if self.stats_file is None:
+        # 在每个worker内懒加载独立的文件句柄，避免文件指针冲突
+        if getattr(self, 'stats_file', None) is None:
             self.stats_file = open(self.stats_file_path, 'r')
         
         try:
@@ -188,7 +313,7 @@ class MyDataset(torch.utils.data.Dataset):
         
         return None
 
-    def get_item_statistics(self, item_id, timestamp, max_users=10):
+    def get_item_statistics(self, item_id, timestamp, max_users=100):
         """
         获取指定item在指定时间戳的统计信息
         
@@ -221,7 +346,11 @@ class MyDataset(torch.utils.data.Dataset):
             'prev_24h_exposure_users': [],
             'prev_24h_click_users': [],
             'all_time_exposure_users': [],
-            'all_time_click_users': []
+            'all_time_click_users': [],
+            'prev_7d_exposure_users': [],
+            'prev_7d_click_users': [],
+            'prev_24h_exposure_count': 0,
+            'prev_24h_click_count': 0
         }
         
         # 前1小时
@@ -230,32 +359,47 @@ class MyDataset(torch.utils.data.Dataset):
             hour_stats = item_stats[str(prev_hour)]
             exposure_users = hour_stats['exposure_users']
             click_users = hour_stats['click_users']
-            
-            # 统计用户出现次数，选择出现次数最多的用户
+            # Top用户
             exposure_counter = Counter()
             click_counter = Counter()
-            
             exposure_counter.update(exposure_users)
             click_counter.update(click_users)
-            
-            # 选择出现次数最多的用户，如果次数相同则按用户ID排序
             top_exposure_users = [user for user, _ in exposure_counter.most_common(max_users)]
             top_click_users = [user for user, _ in click_counter.most_common(max_users)]
-            
             stats['prev_hour_exposure_users'] = top_exposure_users
             stats['prev_hour_click_users'] = top_click_users
+            # 计数使用len累加
+            stats['prev_hour_exposure_count'] = int(len(exposure_users))
+            stats['prev_hour_click_count'] = int(len(click_users))
         
         # 前24小时（最近24小时，不包括当前小时）
         prev_24h_start = target_hour - 24 * 3600
+        prev_7d_start = target_hour - 7 * 24 * 3600
         prev_24h_exposure_users = []
         prev_24h_click_users = []
+        prev_24h_exposure_count = 0
+        prev_24h_click_count = 0
+        prev_7d_exposure_users = []
+        prev_7d_click_users = []
+        prev_7d_exposure_count = 0
+        prev_7d_click_count = 0
         
-        # 收集前24小时的所有用户，按时间顺序（从早到晚）
+        # 收集前24小时与7天内的所有用户与事件计数，按时间顺序（从早到晚）
         for hour_stamp in range(prev_24h_start, target_hour, 3600):
             if str(hour_stamp) in item_stats:
                 hour_stats = item_stats[str(hour_stamp)]
                 prev_24h_exposure_users.extend(hour_stats['exposure_users'])
                 prev_24h_click_users.extend(hour_stats['click_users'])
+                prev_24h_exposure_count += int(len(hour_stats['exposure_users']))
+                prev_24h_click_count += int(len(hour_stats['click_users']))
+
+        for hour_stamp in range(prev_7d_start, target_hour, 3600):
+            if str(hour_stamp) in item_stats:
+                hour_stats = item_stats[str(hour_stamp)]
+                prev_7d_exposure_users.extend(hour_stats['exposure_users'])
+                prev_7d_click_users.extend(hour_stats['click_users'])
+                prev_7d_exposure_count += int(len(hour_stats['exposure_users']))
+                prev_7d_click_count += int(len(hour_stats['click_users']))
         
         # 统计用户出现次数，选择出现次数最多的用户
         prev_24h_exposure_counter = Counter()
@@ -270,10 +414,26 @@ class MyDataset(torch.utils.data.Dataset):
         
         stats['prev_24h_exposure_users'] = top_prev_24h_exposure_users
         stats['prev_24h_click_users'] = top_prev_24h_click_users
+        stats['prev_24h_exposure_count'] = int(prev_24h_exposure_count)
+        stats['prev_24h_click_count'] = int(prev_24h_click_count)
+
+        # 7天窗口Top用户
+        prev_7d_exposure_counter = Counter()
+        prev_7d_click_counter = Counter()
+        prev_7d_exposure_counter.update(prev_7d_exposure_users)
+        prev_7d_click_counter.update(prev_7d_click_users)
+        top_prev_7d_exposure_users = [user for user, _ in prev_7d_exposure_counter.most_common(max_users)]
+        top_prev_7d_click_users = [user for user, _ in prev_7d_click_counter.most_common(max_users)]
+        stats['prev_7d_exposure_users'] = top_prev_7d_exposure_users
+        stats['prev_7d_click_users'] = top_prev_7d_click_users
+        stats['prev_7d_exposure_count'] = int(prev_7d_exposure_count)
+        stats['prev_7d_click_count'] = int(prev_7d_click_count)
         
         # 之前所有时间（不包括当前时间戳所在的小时）
         all_exposure_users = []
         all_click_users = []
+        all_time_exposure_count = 0
+        all_time_click_count = 0
         
         # 收集所有历史用户（不需要按时间顺序，因为Counter只关心出现次数）
         for hour_stamp in item_stats.keys():
@@ -281,6 +441,8 @@ class MyDataset(torch.utils.data.Dataset):
                 hour_stats = item_stats[hour_stamp]
                 all_exposure_users.extend(hour_stats['exposure_users'])
                 all_click_users.extend(hour_stats['click_users'])
+                all_time_exposure_count += int(len(hour_stats['exposure_users']))
+                all_time_click_count += int(len(hour_stats['click_users']))
         
         # 统计用户出现次数，选择出现次数最多的用户
         all_exposure_counter = Counter()
@@ -295,6 +457,18 @@ class MyDataset(torch.utils.data.Dataset):
         
         stats['all_time_exposure_users'] = top_all_exposure_users
         stats['all_time_click_users'] = top_all_click_users
+        # 全时段与前1小时计数已按事件数统计
+        stats['all_time_exposure_count'] = int(all_time_exposure_count)
+        stats['all_time_click_count'] = int(all_time_click_count)
+
+        # CTRs（点击率）
+        def safe_ctr(clicks, expos):
+            return float(clicks) / float(expos) if float(expos) > 0 else 0.0
+
+        stats['ctr_prev_hour'] = safe_ctr(stats.get('prev_hour_click_count', 0), stats.get('prev_hour_exposure_count', 0))
+        stats['ctr_prev_24h'] = safe_ctr(stats.get('prev_24h_click_count', 0), stats.get('prev_24h_exposure_count', 0))
+        stats['ctr_prev_7d'] = safe_ctr(stats.get('prev_7d_click_count', 0), stats.get('prev_7d_exposure_count', 0))
+        stats['ctr_all_time'] = safe_ctr(stats.get('all_time_click_count', 0), stats.get('all_time_exposure_count', 0))
         
         return stats
 
@@ -318,12 +492,14 @@ class MyDataset(torch.utils.data.Dataset):
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
 
         ext_user_sequence = []
+        max_timestamp = 0
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, timestamp = record_tuple
             if u and user_feat:
                 ext_user_sequence.insert(0, (u, user_feat, 2, action_type, timestamp))
             if i and item_feat:
                 ext_user_sequence.append((i, item_feat, 1, action_type, timestamp))
+            max_timestamp = max(max_timestamp, timestamp)
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -367,6 +543,7 @@ class MyDataset(torch.utils.data.Dataset):
             feat['1302'] = (weekday + 1) if timestamp > 0 else 0  # 1..7
             feat['1303'] = (hour + 1) if timestamp > 0 else 0      # 1..24
             feat['1304'] = 0  # 先置0，占位，循环结束后回填正确分桶
+            feat['1305'] = np.log1p(max_timestamp - timestamp)
             if type_ == 1:
                 item_stats = self.get_item_statistics(i, timestamp)
                 feat['1401'] = item_stats['prev_hour_exposure_users']
@@ -375,11 +552,39 @@ class MyDataset(torch.utils.data.Dataset):
                 feat['1404'] = item_stats['prev_24h_click_users']
                 feat['1405'] = item_stats['all_time_exposure_users']
                 feat['1406'] = item_stats['all_time_click_users']
-                if act_type is not None:
+                # 新增：7天窗口用户数组
+                feat['1407'] = item_stats.get('prev_7d_exposure_users', [])
+                feat['1408'] = item_stats.get('prev_7d_click_users', [])
+                # 次数特征取log分桶（log1p再向下取整）
+                def _log_bucket(v):
+                    try:
+                        vv = float(v)
+                    except Exception:
+                        vv = 0.0
+                    if vv < 0:
+                        vv = 0.0
+                    # 次数上限裁剪为4万，再进行log1p与向下取整
+                    if vv > 40000.0:
+                        vv = 40000.0
+                    return int(np.floor(np.log1p(vv)))
+
+                feat['1601'] = _log_bucket(item_stats.get('prev_24h_exposure_count', 0))
+                feat['1602'] = _log_bucket(item_stats.get('prev_24h_click_count', 0))
+                # 计数（小时、7天、全时）
+                feat['1603'] = _log_bucket(item_stats.get('prev_hour_exposure_count', 0))
+                feat['1604'] = _log_bucket(item_stats.get('prev_hour_click_count', 0))
+                feat['1605'] = _log_bucket(item_stats.get('prev_7d_exposure_count', 0))
+                feat['1606'] = _log_bucket(item_stats.get('prev_7d_click_count', 0))
+                feat['1607'] = _log_bucket(item_stats.get('all_time_exposure_count', 0))
+                feat['1608'] = _log_bucket(item_stats.get('all_time_click_count', 0))
+                # CTR（小时、24h、7天、全时）
+                feat['1611'] = float(item_stats.get('ctr_prev_hour', 0.0))
+                feat['1612'] = float(item_stats.get('ctr_prev_24h', 0.0))
+                feat['1613'] = float(item_stats.get('ctr_prev_7d', 0.0))
+                feat['1614'] = float(item_stats.get('ctr_all_time', 0.0))
+                if act_type is None:
                     act_type = -1
                 feat['1501'] = act_type + 1
-
-
             seq_feat[idx] = feat
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
@@ -471,7 +676,8 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value = {}
         feat_statistics = {}
         feat_types = {}
-        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304', '1501']
+        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304', '1501',
+                                     '1601','1602','1603','1604','1605','1606','1607','1608']
         feat_types['item_sparse'] = [
             '100',
             '117',
@@ -488,11 +694,11 @@ class MyDataset(torch.utils.data.Dataset):
             '122',
             '116',
         ]
-        feat_types['user_stats_array'] = ['1401', '1402', '1403', '1404','1405','1406']
+        feat_types['user_stats_array'] = ['1401', '1402', '1403', '1404','1405','1406','1407','1408']
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
-        feat_types['user_continual'] = []
+        feat_types['user_continual'] = ['1305', '1611', '1612', '1613', '1614']
         # 连续型特征
         feat_types['item_continual'] = []
         # 将时间特征改为稀疏特征（整数类别），使用数字型特征ID
@@ -501,10 +707,16 @@ class MyDataset(torch.utils.data.Dataset):
 
         for feat_id in feat_types['user_sparse']:
             feat_default_value[feat_id] = 0
-            feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
+            try:
+                feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
+            except Exception:
+                feat_statistics[feat_id] = 0
         for feat_id in feat_types['item_sparse']:
             feat_default_value[feat_id] = 0
-            feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
+            try:
+                feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
+            except Exception:
+                feat_statistics[feat_id] = 0
         for feat_id in feat_types['item_array']:
             feat_default_value[feat_id] = [0]
             feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
@@ -512,9 +724,9 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = [0]
             feat_statistics[feat_id] = len(self.indexer['f'][feat_id])
         for feat_id in feat_types['user_continual']:
-            feat_default_value[feat_id] = 0
+            feat_default_value[feat_id] = 0.0
         for feat_id in feat_types['item_continual']:
-            feat_default_value[feat_id] = 0
+            feat_default_value[feat_id] = 0.0
         for feat_id in feat_types['user_stats_array']:
             feat_default_value[feat_id] = [0]
             feat_statistics[feat_id] = self.usernum
@@ -523,12 +735,17 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value['1302'] = 0
         feat_default_value['1303'] = 0
         feat_default_value['1304'] = 0
+        feat_default_value['1501'] = 0
         feat_statistics['1301'] = 12
         feat_statistics['1302'] = 7
         feat_statistics['1303'] = 24
         # t_delta 使用固定边界分桶：非零桶 = 1(零间隔) + len(edges) + 1(>max边界)
         # 当前 edges=20 → 非零桶=22（+0 padding）
         feat_statistics['1304'] = 22
+        feat_statistics['1501'] = 2
+        # 次数分桶：log1p裁剪至4万后floor → 0..10 共11个桶
+        for k in ['1601','1602','1603','1604','1605','1606','1607','1608']:
+            feat_statistics[k] = 11
         for feat_id in feat_types['item_emb']:
             feat_default_value[feat_id] = np.zeros(
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
@@ -655,6 +872,7 @@ class MyDataset(torch.utils.data.Dataset):
         seq_feat_pre.update(build_array(self.feature_types['item_array'], seq_feat_list))
         pos_feat_pre.update(build_array(self.feature_types['item_array'], pos_feat_list))
         seq_feat_pre.update(build_array(self.feature_types['user_array'], seq_feat_list))
+        seq_feat_pre.update(build_array(self.feature_types['user_stats_array'], seq_feat_list))
         # multimodal emb
         seq_feat_pre.update(build_emb(self.feature_types['item_emb'], seq_feat_list))
         pos_feat_pre.update(build_emb(self.feature_types['item_emb'], pos_feat_list))
@@ -950,6 +1168,7 @@ class MyTestDataset(MyDataset):
         # arrays
         seq_feat_pre.update(build_array(self.feature_types['item_array'], seq_feat_list))
         seq_feat_pre.update(build_array(self.feature_types['user_array'], seq_feat_list))
+        seq_feat_pre.update(build_array(self.feature_types['user_stats_array'], seq_feat_list))
         # multimodal emb
         seq_feat_pre.update(build_emb(self.feature_types['item_emb'], seq_feat_list))
 
