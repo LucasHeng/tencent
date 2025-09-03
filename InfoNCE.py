@@ -81,7 +81,6 @@ def info_nce(query, positive_key, negative_keys=None, next_action_type=None, tem
 
     query, positive_key, negative_keys = normalize(query, positive_key, negative_keys)
     
-    S = query.shape[0]
     positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
     negative_keys = negative_keys.reshape(-1, negative_keys.shape[-1])
     negative_logits = query @ transpose(negative_keys)
@@ -101,7 +100,7 @@ def info_nce(query, positive_key, negative_keys=None, next_action_type=None, tem
     correct_topk = correct.any(dim=1)  # [S]
     accuracy = correct_topk.float().mean() * 100.0
 
-    return F.cross_entropy(logits / temperature, labels, reduction=reduction), accuracy, diag_mean, non_diag_mean, 0
+    return F.cross_entropy(logits / temperature, labels, reduction=reduction), accuracy.item(), diag_mean.item(), non_diag_mean.item(), 0
 
 
 def transpose(x):

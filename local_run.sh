@@ -12,4 +12,4 @@ export USER_CACHE_PATH="/home/lucasheng/Tencent/cache/"
 # cd ${RUNTIME_SCRIPT_DIR}
 
 # write your code below
-python -u main.py --hidden_units 128 --num_blocks 4 --num_heads 4 --l2_emb 0.1 --num_epochs 4 --use_hstu_attn --sample_neg_num 2 --use_all_in_batch --batch_size 16 --skip_mm_emb --norm_first
+python -u main.py --hidden_units 128 --num_blocks 6 --num_heads 8 --l2_emb 0.1 --num_epochs 4 --use_hstu_attn --sample_neg_num 2 --use_all_in_batch --batch_size 16 --skip_mm_emb --norm_first

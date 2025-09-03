@@ -176,30 +176,42 @@ def _hstu_attention_maybe_from_cache(
     q_reshaped = q.view(B, n, num_heads, attention_dim)
     k_reshaped = k.view(B, n, num_heads, attention_dim)
     v_reshaped = v.view(B, n, num_heads, linear_dim)
-    
+
     # Apply time-based RoPE to q and k
     q_rope = apply_rope(q_reshaped, all_timestamps, attention_dim)
     k_rope = apply_rope(k_reshaped, all_timestamps, attention_dim)
 
-    # Compute attention scores with time-aware rotations
-    qk_attn = torch.einsum(
-        "bnhd,bmhd->bhnm",
-        q_rope,
-        k_rope,
-    )
-    
-    # Add relative attention bias (if any)
-    qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
 
-    qk_attn = F.silu(qk_attn) / n
-    qk_attn = qk_attn * attention_mask
+    if hasattr(F, 'scaled_dot_product_attention'):
+        # reshape为multi-head格式
+        q_rope = q_rope.transpose(1, 2)
+        k_rope = k_rope.transpose(1, 2)
+        v_reshaped = v_reshaped.transpose(1, 2)
+        # PyTorch 2.0+ 使用内置的Flash Attention
+        attn_output = F.scaled_dot_product_attention(
+            q_rope, k_rope, v_reshaped, dropout_p=0.0, attn_mask=attention_mask
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, n, num_heads * linear_dim)
+    else:
+        # Compute attention scores with time-aware rotations
+        qk_attn = torch.einsum(
+            "bnhd,bmhd->bhnm",
+            q_rope,
+            k_rope,
+        )
     
-    # Apply attention to values
-    attn_output = torch.einsum(
-        "bhnm,bmhd->bnhd",
-        qk_attn,
-        v_reshaped,
-    ).reshape(B, n, num_heads * linear_dim)
+        # Add relative attention bias (if any)n
+        qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
+
+        qk_attn = F.silu(qk_attn) / n
+        qk_attn = qk_attn * attention_mask
+        
+        # Apply attention to values
+        attn_output = torch.einsum(
+            "bhnm,bmhd->bnhd",
+            qk_attn,
+            v_reshaped,
+        ).reshape(B, n, num_heads * linear_dim)
     return attn_output
 
 class HSTUAttention(torch.nn.Module):
@@ -335,7 +347,8 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor
+        attention_mask: torch.Tensor,
+        all_timestamps: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """
         Args:
@@ -381,7 +394,9 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 q=q,
                 k=k,
                 v=v,
-                attention_mask=attention_mask
+                attention_mask=attention_mask.unsqueeze(1),
+                all_timestamps=all_timestamps,
+                rel_attn_bias=self._rel_attn_bias,
             )
 
         if self._concat_ua:
@@ -398,10 +413,9 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                     training=self.training,
                 )
             )
-            + x
         )
 
-        return new_outputs
+        return new_outputs, None
 
 
 
@@ -521,6 +535,7 @@ class BaselineModel(torch.nn.Module):
         self.attention_layers = torch.nn.ModuleList()
         self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
+        self.use_hstu_attn = args.use_hstu_attn
 
         self._init_feat_info(feat_statistics, feat_types)
 
@@ -547,12 +562,18 @@ class BaselineModel(torch.nn.Module):
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
-            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
 
             if args.use_hstu_attn:
-                new_attn_layer = HSTUAttention(
-                    args.hidden_units, args.num_heads, 0.0, 
+                new_attn_layer = SequentialTransductionUnitJagged(
+                    embedding_dim=args.hidden_units,
+                    linear_hidden_dim=args.hidden_units // args.num_heads,
+                    attention_dim=args.hidden_units // args.num_heads,
+                    normalization="hstu_rel_bias",
+                    linear_config="uvqk",
+                    linear_activation="silu",
+                    num_heads=args.num_heads, 
+                    dropout_ratio=0.0,
+                    attn_dropout_ratio=0.0,
                     relative_attention_bias_module=RelativeBucketedTimeAndPositionBasedBias(
                             max_seq_len= self.maxlen + 1,  # accounts for next item.
                             num_buckets=128,
@@ -563,16 +584,19 @@ class BaselineModel(torch.nn.Module):
                         concat_ua=args.concat_ua
                 )
             else:
+                new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+                self.attention_layernorms.append(new_attn_layernorm)
                 new_attn_layer = FlashMultiHeadAttention(
                     args.hidden_units, args.num_heads, args.dropout_rate
                 )  # 优化：用FlashAttention替代标准Attention
+                new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+                self.forward_layernorms.append(new_fwd_layernorm)
+
+                new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
+                self.forward_layers.append(new_fwd_layer)
             self.attention_layers.append(new_attn_layer)
 
-            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
 
-            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
 
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
@@ -758,15 +782,19 @@ class BaselineModel(torch.nn.Module):
 
         seq_timestamp = seq_timestamp.to(self.dev)
         for i in range(len(self.attention_layers)):
-            if self.norm_first:
-                x = self.attention_layernorms[i](seqs)
-                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask, all_timestamps=seq_timestamp)
-                seqs = seqs + mha_outputs
-                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
+            if self.use_hstu_attn:
+                seqs, _ = self.attention_layers[i](seqs, attention_mask=attention_mask, all_timestamps=seq_timestamp)
+                # seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_layernorms[i](seqs + mha_outputs)
-                seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
+                if self.norm_first:
+                    x = self.attention_layernorms[i](seqs)
+                    mha_outputs, _ = self.attention_layers[i](x, attention_mask=attention_mask, all_timestamps=seq_timestamp)
+                    seqs = seqs + mha_outputs
+                    seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
+                else:
+                    mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
+                    seqs = self.attention_layernorms[i](seqs + mha_outputs)
+                    seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
         log_feats = self.last_layernorm(seqs)
 
