@@ -17,24 +17,6 @@ from InfoNCE import InfoNCE
 import random
 import math
 
-import os
-import shutil
-
-def clear_folder(folder_path):
-    if not os.path.exists(folder_path):
-        print(f"文件夹不存在: {folder_path}")
-        return
-    
-    for filename in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, filename)
-        try:
-            if os.path.isfile(file_path) or os.path.islink(file_path):
-                os.unlink(file_path)  # 删除文件或链接
-            elif os.path.isdir(file_path):
-                shutil.rmtree(file_path)  # 删除子文件夹
-        except Exception as e:
-            print(f"删除失败 {file_path}: {e}")
-
 class WarmupCosineScheduler:
     """
     Warmup + Cosine Annealing Learning Rate Scheduler
@@ -105,7 +87,7 @@ def get_args():
     # Train params
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--lr', default=0.005, type=float)
-    parser.add_argument('--maxlen', default=99, type=int)
+    parser.add_argument('--maxlen', default=101, type=int)
 
     # Baseline Model construction
     parser.add_argument('--hidden_units', default=32, type=int)
@@ -127,7 +109,7 @@ def get_args():
     # 性能优化参数
     parser.add_argument('--use_gradient_checkpointing', action='store_true', help='启用梯度检查点以减少内存占用')
     parser.add_argument('--compile_model', action='store_true', help='使用torch.compile优化模型')
-    parser.add_argument('--use_amp', action='store_true', default=False, help='使用混合精度训练')
+    parser.add_argument('--use_amp', action='store_false', default=True, help='使用混合精度训练')
     parser.add_argument('--optimize_backward', action='store_true', default=True, help='启用backward性能优化')
     parser.add_argument('--gradient_clip', default=0.0, type=float, help='梯度裁剪阈值')
     parser.add_argument('--grad_norm_freq', default=20, type=int, help='梯度范数计算频率（每N步计算一次）')
@@ -160,7 +142,6 @@ if __name__ == '__main__':
 
     args = get_args()
     args.save_path = os.environ.get('USER_CACHE_PATH')
-    clear_folder(args.save_path)
 
     dataset = MyDataset(data_path, args)
     train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
