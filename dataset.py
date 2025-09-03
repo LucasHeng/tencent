@@ -86,6 +86,12 @@ class MyDataset(torch.utils.data.Dataset):
             print("未发现缓存的统计信息，开始处理数据...")
             self.process_data()
         
+        # 检查全局统计文件是否存在，如果不存在则生成
+        global_stats_file = Path(self.save_path) / "global_hourly_stats.jsonl"
+        if not global_stats_file.exists():
+            print("未发现全局统计文件，开始生成...")
+            self._generate_global_hourly_stats_from_existing()
+        
 
     def _load_offsets(self):
         """
@@ -149,6 +155,9 @@ class MyDataset(torch.utils.data.Dataset):
         # 将统计信息写入文件并创建offset索引
         self._save_stats_to_file(temp_stats)
         
+        # 生成全局每小时统计
+        self._generate_global_hourly_stats(temp_stats)
+        
         # 清理临时数据
         del temp_stats
         
@@ -201,6 +210,98 @@ class MyDataset(torch.utils.data.Dataset):
         print(f"Offset索引已保存到: {self.offsets_file_path}")
         print(f"总item数: {len(self.item_offsets)}")
 
+    def _generate_global_hourly_stats(self, temp_stats):
+        """
+        生成全局每小时统计信息（所有item的总曝光次数和总点击次数）
+        
+        Args:
+            temp_stats: 临时统计信息
+        """
+        print("生成全局每小时统计...")
+        
+        # 收集所有小时的时间戳
+        all_hours = set()
+        for item_id, hours in temp_stats.items():
+            all_hours.update(hours.keys())
+        
+        # 计算每个小时的全局统计
+        global_hourly_stats = {}
+        for hour_stamp in tqdm(all_hours, desc="计算全局每小时统计"):
+            total_exposure = 0
+            total_click = 0
+            
+            for item_id, hours in temp_stats.items():
+                if hour_stamp in hours:
+                    hour_stats = hours[hour_stamp]
+                    total_exposure += len(hour_stats['exposure_users'])
+                    total_click += len(hour_stats['click_users'])
+            
+            global_hourly_stats[hour_stamp] = {
+                'exposure_count': total_exposure,
+                'click_count': total_click
+            }
+        
+        # 保存全局统计到文件
+        global_stats_file = Path(self.save_path) / "global_hourly_stats.jsonl"
+        with open(global_stats_file, 'w') as f:
+            for hour_stamp in sorted(global_hourly_stats.keys()):
+                stats_data = {
+                    'hour_stamp': hour_stamp,
+                    'exposure_count': global_hourly_stats[hour_stamp]['exposure_count'],
+                    'click_count': global_hourly_stats[hour_stamp]['click_count']
+                }
+                f.write(json.dumps(stats_data, ensure_ascii=False) + '\n')
+        
+        print(f"全局每小时统计已保存到: {global_stats_file}")
+        print(f"总小时数: {len(global_hourly_stats)}")
+
+    def _generate_global_hourly_stats_from_existing(self):
+        """
+        从现有的item统计文件生成全局每小时统计
+        """
+        print("从现有统计文件生成全局每小时统计...")
+        
+        # 收集所有小时的时间戳和统计信息
+        all_hours = set()
+        hour_stats_map = defaultdict(lambda: {'exposure_count': 0, 'click_count': 0})
+        
+        # 读取现有的item统计文件
+        if not self.stats_file_path.exists():
+            print("未找到item统计文件，无法生成全局统计")
+            return
+        
+        with open(self.stats_file_path, 'r') as f:
+            for line in tqdm(f, desc="读取item统计文件"):
+                try:
+                    item_data = json.loads(line.strip())
+                    item_id = item_data['item_id']
+                    stats = item_data['stats']
+                    
+                    for hour_stamp_str, hour_stats in stats.items():
+                        hour_stamp = int(hour_stamp_str)
+                        all_hours.add(hour_stamp)
+                        
+                        # 累加曝光和点击次数
+                        hour_stats_map[hour_stamp]['exposure_count'] += len(hour_stats['exposure_users'])
+                        hour_stats_map[hour_stamp]['click_count'] += len(hour_stats['click_users'])
+                        
+                except Exception as e:
+                    print(f"解析item统计行失败: {e}")
+                    continue
+        
+        # 保存全局统计到文件
+        global_stats_file = Path(self.save_path) / "global_hourly_stats.jsonl"
+        with open(global_stats_file, 'w') as f:
+            for hour_stamp in sorted(all_hours):
+                stats_data = {
+                    'hour_stamp': hour_stamp,
+                    'exposure_count': hour_stats_map[hour_stamp]['exposure_count'],
+                    'click_count': hour_stats_map[hour_stamp]['click_count']
+                }
+                f.write(json.dumps(stats_data, ensure_ascii=False) + '\n')
+        
+        print(f"全局每小时统计已保存到: {global_stats_file}")
+        print(f"总小时数: {len(all_hours)}")
 
     def _safe_feat_stat(self, k):
         return self._get_feat_stat(self._ensure_feat_stats(), k)
@@ -251,6 +352,11 @@ class MyDataset(torch.utils.data.Dataset):
         # 使Dataset可pickle：去掉不可pickle的文件对象，由worker进程内再懒加载
         state = self.__dict__.copy()
         state['data_file'] = None
+        state['stats_file'] = None
+        state['global_stats_file'] = None
+        # 保留全局统计缓存，避免重复加载
+        if hasattr(self, '_global_stats_cache'):
+            state['_global_stats_cache'] = self._global_stats_cache
         return state
 
     def __del__(self):
@@ -258,6 +364,10 @@ class MyDataset(torch.utils.data.Dataset):
         try:
             if getattr(self, 'data_file', None) is not None:
                 self.data_file.close()
+            if getattr(self, 'stats_file', None) is not None:
+                self.stats_file.close()
+            if getattr(self, 'global_stats_file', None) is not None:
+                self.global_stats_file.close()
         except Exception:
             pass
 
@@ -312,6 +422,55 @@ class MyDataset(torch.utils.data.Dataset):
             return None
         
         return None
+
+    def _load_global_hourly_stats(self, hour_stamp):
+        """
+        加载指定小时的全局统计信息（所有item的总曝光次数和总点击次数）
+        
+        Args:
+            hour_stamp: 小时时间戳
+            
+        Returns:
+            dict: 包含全局统计信息的字典
+        """
+        # 全局统计文件路径
+        global_stats_file = Path(self.save_path) / "global_hourly_stats.jsonl"
+        
+        if not global_stats_file.exists():
+            return {'exposure_count': 0, 'click_count': 0}
+        
+        try:
+            # 懒加载全局统计缓存
+            if not hasattr(self, '_global_stats_cache'):
+                self._load_global_stats_cache()
+            
+            # 从缓存中获取统计信息
+            return self._global_stats_cache.get(hour_stamp, {'exposure_count': 0, 'click_count': 0})
+            
+        except Exception as e:
+            print(f"读取全局统计信息失败: {e}")
+            return {'exposure_count': 0, 'click_count': 0}
+
+    def _load_global_stats_cache(self):
+        """
+        加载全局统计缓存到内存
+        """
+        global_stats_file = Path(self.save_path) / "global_hourly_stats.jsonl"
+        self._global_stats_cache = {}
+        
+        try:
+            with open(global_stats_file, 'r') as f:
+                for line in f:
+                    data = json.loads(line.strip())
+                    hour_stamp = data.get('hour_stamp')
+                    if hour_stamp is not None:
+                        self._global_stats_cache[hour_stamp] = {
+                            'exposure_count': data.get('exposure_count', 0),
+                            'click_count': data.get('click_count', 0)
+                        }
+        except Exception as e:
+            print(f"加载全局统计缓存失败: {e}")
+            self._global_stats_cache = {}
 
     def get_item_statistics(self, item_id, timestamp, max_users=100):
         """
@@ -470,6 +629,12 @@ class MyDataset(torch.utils.data.Dataset):
         stats['ctr_prev_7d'] = safe_ctr(stats.get('prev_7d_click_count', 0), stats.get('prev_7d_exposure_count', 0))
         stats['ctr_all_time'] = safe_ctr(stats.get('all_time_click_count', 0), stats.get('all_time_exposure_count', 0))
         
+        # 计算每小时全局统计（所有item的总曝光次数和总点击次数）
+        # 从全局统计文件中读取当前小时的统计
+        global_stats = self._load_global_hourly_stats(target_hour)
+        stats['hourly_global_exposure_count'] = global_stats.get('exposure_count', 0)
+        stats['hourly_global_click_count'] = global_stats.get('click_count', 0)
+        
         return stats
 
     def __getitem__(self, uid):
@@ -582,6 +747,10 @@ class MyDataset(torch.utils.data.Dataset):
                 feat['1612'] = float(item_stats.get('ctr_prev_24h', 0.0))
                 feat['1613'] = float(item_stats.get('ctr_prev_7d', 0.0))
                 feat['1614'] = float(item_stats.get('ctr_all_time', 0.0))
+                
+                # 每小时全局统计
+                feat['1701'] = float(item_stats.get('hourly_global_exposure_count', 0))  # 当前小时全局曝光次数
+                feat['1702'] = float(item_stats.get('hourly_global_click_count', 0))     # 当前小时全局点击次数
                 if act_type is None:
                     act_type = -1
                 feat['1501'] = act_type + 1
@@ -698,7 +867,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
-        feat_types['user_continual'] = ['1305', '1611', '1612', '1613', '1614']
+        feat_types['user_continual'] = ['1305', '1611', '1612', '1613', '1614', '1701', '1702']
         # 连续型特征
         feat_types['item_continual'] = []
         # 将时间特征改为稀疏特征（整数类别），使用数字型特征ID
