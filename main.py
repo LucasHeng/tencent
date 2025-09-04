@@ -121,7 +121,7 @@ def get_args():
     parser.add_argument('--warmup_steps', default=1000, type=int, help='Warmup步数')
     parser.add_argument('--warmup_lr', default=1e-6, type=float, help='Warmup起始学习率')
     parser.add_argument('--min_lr', default=1e-7, type=float, help='最小学习率')
-
+    
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
     
@@ -130,6 +130,34 @@ def get_args():
 
     return args
 
+# 1. 模型参数显存（固定值，与batch无关）
+def get_model_param_memory(model):
+    total = 0
+    for param in model.parameters():
+        total += param.numel() * param.element_size()  # 元素数量 × 单个元素字节数
+    return total / 1024**2  # 转换为MB
+
+# 2. 输入数据显存（与batch_size线性相关）
+def get_input_memory(input_tensor):
+    return input_tensor.element_size() * input_tensor.nelement() / 1024**2  # MB
+
+# 3. 中间变量+梯度的峰值显存（前向+反向传播）
+def get_peak_memory():
+    # 活跃显存峰值（包含中间变量、梯度等）
+    peak_active = torch.cuda.memory_stats()["active_bytes.all.peak"] / 1024**2
+    # 缓存显存（框架优化用，如CuDNN卷积缓存）
+    peak_reserved = torch.cuda.memory_stats()["reserved_bytes.all.peak"] / 1024**2
+    return peak_active, peak_reserved
+
+# 4. 优化器状态显存（如Adam需要存储动量和二阶矩）
+def get_optimizer_memory(optimizer):
+    total = 0
+    for param_group in optimizer.param_groups:
+        for param in param_group['params']:
+            # 每个参数的优化器状态（如Adam有2个额外状态）
+            if param.grad is not None:
+                total += param.grad.numel() * param.grad.element_size() * 2  # 假设Adam
+    return total / 1024**2  # MB
 
 if __name__ == '__main__':   
     set_seed(42)
@@ -282,7 +310,7 @@ if __name__ == '__main__':
             if step % args.print_freq == 0:
                 elapsed_str = _format_elapsed(time.time() - t0)
                 log_json = json.dumps(
-                    {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str, 'acc': acc.item(), 'click_acc': future_click_acc},
+                    {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str, 'acc': acc, 'click_acc': future_click_acc},
                     ensure_ascii=False,
                 )
                 print(log_json)
@@ -401,9 +429,9 @@ if __name__ == '__main__':
                     selected_masks = pos_mask[indices]
                     loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
                 valid_loss_sum += loss.item()
-                valid_acc_sum += acc.item()
-                valid_pos_sim_sum += pos_sim.item()
-                valid_neg_sim_sum += neg_sim.item()
+                valid_acc_sum += acc
+                valid_pos_sim_sum += pos_sim
+                valid_neg_sim_sum += neg_sim
                 valid_future_click_acc_sum += future_click_acc
                 # print(f"Valid Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
                 # print(f"Valid Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
