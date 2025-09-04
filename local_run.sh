@@ -5,6 +5,8 @@ export TRAIN_TF_EVENTS_PATH="/home/lucasheng/Tencent/tf_events/"
 export TRAIN_DATA_PATH="/home/lucasheng/Tencent/data/TencentGR_1k/"
 export TRAIN_CKPT_PATH="/home/lucasheng/Tencent/ckpt/"
 export USER_CACHE_PATH="/home/lucasheng/Tencent/cache/"
+export EVAL_DATA_PATH="/home/lucasheng/Tencent/data/TencentGR_1k/"
+export MODEL_OUTPUT_PATH="/home/lucasheng/Tencent/ckpt/global_step7.valid_loss=1.1221/"
 
 # # show ${RUNTIME_SCRIPT_DIR}
 # echo ${RUNTIME_SCRIPT_DIR}
@@ -13,3 +15,5 @@ export USER_CACHE_PATH="/home/lucasheng/Tencent/cache/"
 
 # write your code below
 python -u main.py --hidden_units 128 --num_blocks 6 --num_heads 8 --l2_emb 0.1 --num_epochs 4 --use_hstu_attn --sample_neg_num 2 --use_all_in_batch --batch_size 16 --skip_mm_emb --norm_first
+
+python -u infer.py --skip_mm_emb --norm_first

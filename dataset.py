@@ -62,13 +62,18 @@ class MyDataset(torch.utils.data.Dataset):
         self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-        print(f'self.feature_types {self.feature_types}')
+        
+        item_sparse_dict = {k: self.feat_statistics[k] for k in self.feature_types['item_sparse']}
+        print(f'item_spase: {item_sparse_dict}')
+        item_array_dict = {k: self.feat_statistics[k] for k in self.feature_types['item_array']}
+        print(f'item_array: {item_array_dict}')
+        user_sparse_dict = {k: self.feat_statistics[k] for k in self.feature_types['user_sparse']}
+        print(f'user_sparse: {user_sparse_dict}')
+        user_array_dict = {k: self.feat_statistics[k] for k in self.feature_types['user_array']}
+        print(f'user_array: {user_array_dict}')
+        
         print(f'self.feat_statistics {self.feat_statistics}')
-        # 统计时间间隔分桶：类别0为padding，1为零间隔，2..为各边界桶
-        try:
-            self._tdelta_bucket_counts = np.zeros(int(self._safe_feat_stat('1304')) + 1, dtype=np.int64)
-        except Exception:
-            self._tdelta_bucket_counts = np.zeros(32, dtype=np.int64)
+
         self._tdelta_total = 0
         # 缓存时间分桶边界，避免 __getitem__ 重复创建
         self._tdelta_edges = np.array([
@@ -313,116 +318,6 @@ class MyDataset(torch.utils.data.Dataset):
         
         return None
 
-    def get_item_statistics(self, item_id, timestamp, max_users=10):
-        """
-        获取指定item在指定时间戳的统计信息
-        
-        Args:
-            item_id: 物品ID
-            timestamp: 时间戳
-            max_users: 每个时间窗口最多返回的用户数量，默认10
-            
-        Returns:
-            dict: 包含统计信息的字典
-        """
-        target_hour =  (timestamp // 3600) * 3600
-        
-        # 从文件加载item的统计信息
-        item_stats = self._load_item_stats_from_file(item_id)
-        if not item_stats:
-            return {
-                'prev_hour_exposure_users': [],
-                'prev_hour_click_users': [],
-                'prev_24h_exposure_users': [],
-                'prev_24h_click_users': [],
-                'all_time_exposure_users': [],
-                'all_time_click_users': []
-            }
-        
-        # 获取前1小时、前24小时、之前所有时间的用户
-        stats = {
-            'prev_hour_exposure_users': [],
-            'prev_hour_click_users': [],
-            'prev_24h_exposure_users': [],
-            'prev_24h_click_users': [],
-            'all_time_exposure_users': [],
-            'all_time_click_users': []
-        }
-        
-        # 前1小时
-        prev_hour = target_hour - 3600
-        if str(prev_hour) in item_stats:
-            hour_stats = item_stats[str(prev_hour)]
-            exposure_users = hour_stats['exposure_users']
-            click_users = hour_stats['click_users']
-            
-            # 统计用户出现次数，选择出现次数最多的用户
-            exposure_counter = Counter()
-            click_counter = Counter()
-            
-            exposure_counter.update(exposure_users)
-            click_counter.update(click_users)
-            
-            # 选择出现次数最多的用户，如果次数相同则按用户ID排序
-            top_exposure_users = [user for user, _ in exposure_counter.most_common(max_users)]
-            top_click_users = [user for user, _ in click_counter.most_common(max_users)]
-            
-            stats['prev_hour_exposure_users'] = top_exposure_users
-            stats['prev_hour_click_users'] = top_click_users
-        
-        # 前24小时（最近24小时，不包括当前小时）
-        prev_24h_start = target_hour - 24 * 3600
-        prev_24h_exposure_users = []
-        prev_24h_click_users = []
-        
-        # 收集前24小时的所有用户，按时间顺序（从早到晚）
-        for hour_stamp in range(prev_24h_start, target_hour, 3600):
-            if str(hour_stamp) in item_stats:
-                hour_stats = item_stats[str(hour_stamp)]
-                prev_24h_exposure_users.extend(hour_stats['exposure_users'])
-                prev_24h_click_users.extend(hour_stats['click_users'])
-        
-        # 统计用户出现次数，选择出现次数最多的用户
-        prev_24h_exposure_counter = Counter()
-        prev_24h_click_counter = Counter()
-        
-        prev_24h_exposure_counter.update(prev_24h_exposure_users)
-        prev_24h_click_counter.update(prev_24h_click_users)
-        
-        # 选择出现次数最多的用户，如果次数相同则按用户ID排序
-        top_prev_24h_exposure_users = [user for user, _ in prev_24h_exposure_counter.most_common(max_users)]
-        top_prev_24h_click_users = [user for user, _ in prev_24h_click_counter.most_common(max_users)]
-        
-        stats['prev_24h_exposure_users'] = top_prev_24h_exposure_users
-        stats['prev_24h_click_users'] = top_prev_24h_click_users
-        
-        # 之前所有时间（不包括当前时间戳所在的小时）
-        all_exposure_users = []
-        all_click_users = []
-        
-        # 收集所有历史用户（不需要按时间顺序，因为Counter只关心出现次数）
-        for hour_stamp in item_stats.keys():
-            if int(hour_stamp) < target_hour:  # 只包括严格小于当前小时的数据
-                hour_stats = item_stats[hour_stamp]
-                all_exposure_users.extend(hour_stats['exposure_users'])
-                all_click_users.extend(hour_stats['click_users'])
-        
-        # 统计用户出现次数，选择出现次数最多的用户
-        all_exposure_counter = Counter()
-        all_click_counter = Counter()
-        
-        all_exposure_counter.update(all_exposure_users)
-        all_click_counter.update(all_click_users)
-        
-        # 选择出现次数最多的用户，如果次数相同则按用户ID排序
-        top_all_exposure_users = [user for user, _ in all_exposure_counter.most_common(max_users)]
-        top_all_click_users = [user for user, _ in all_click_counter.most_common(max_users)]
-        
-        stats['all_time_exposure_users'] = top_all_exposure_users
-        stats['all_time_click_users'] = top_all_click_users
-        
-        return stats
-
     def __getitem__(self, uid):
         """
         获取单个用户的数据，并进行padding处理，生成模型需要的数据格式
@@ -441,16 +336,33 @@ class MyDataset(torch.utils.data.Dataset):
             neg_feat: 负样本特征，每个元素为字典，key为特征ID，value为特征值
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
-
-        ext_user_sequence = []
+        
         max_timestamp = 0
+        user_timestamp = 0
+        for record in reversed(user_sequence):
+            u, i, user_feat, item_feat, action_type, timestamp = record
+            max_timestamp = max(max_timestamp, timestamp)
+            if u and user_feat:
+                user_timestamp = timestamp
+                if max_timestamp != 0 or user_timestamp != 0:
+                    break
+        if user_timestamp != 0:
+            max_timestamp = user_timestamp
+            
+        ts = set()
+        ext_user_sequence = []
+        ext_timestamp = []
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, timestamp = record_tuple
+            if timestamp > max_timestamp:
+                continue
             if u and user_feat:
-                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, timestamp))
+                ext_timestamp.insert(0, max_timestamp)
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, max_timestamp))
             if i and item_feat:
+                ts.add(i)
+                ext_timestamp.append(timestamp)
                 ext_user_sequence.append((i, item_feat, 1, action_type, timestamp))
-            max_timestamp = max(max_timestamp, timestamp)
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -460,17 +372,48 @@ class MyDataset(torch.utils.data.Dataset):
         next_action_type = np.zeros([self.maxlen + 1], dtype=np.int32)
         seq_timestamp = np.zeros([self.maxlen + 1], dtype=np.int32)
 
-        seq_feat = np.empty([self.maxlen + 1], dtype=object)
-        pos_feat = np.empty([self.maxlen + 1], dtype=object)
-        neg_feat = np.empty([self.maxlen + 1, self.sample_neg_num], dtype=object)
+        def item_feat(num=1):
+            item_sparse_feat = {}
+            for feat_id in self.feature_types['item_sparse']:
+                item_sparse_feat[feat_id] = np.zeros([num*(self.maxlen + 1)], dtype=np.int32)
+            item_mm_emb_feat = {}
+            for feat_id in self.feature_types['item_emb']:
+                item_mm_emb_feat[feat_id] = np.zeros([num*(self.maxlen + 1), self.feature_default_value[feat_id].shape[0]], dtype=np.float32)
+            return {
+                'sparse': item_sparse_feat,
+                'mmemb': item_mm_emb_feat,
+            }
+        
+        def item_add_feat():
+            item_add_sparse_feat = {}
+            for feat_id in self.feature_types['item_add_sparse']:
+                item_add_sparse_feat[feat_id] = np.zeros([num*(self.maxlen + 1)], dtype=np.int32)
+            item_add_continual_feat = {}
+            for feat_id in self.feature_types['item_add_continual']:
+                item_add_continual_feat[feat_id] = np.zeros([num*(self.maxlen + 1)], dtype=np.float32)
+            return {
+                'add_sparse': item_add_sparse_feat,
+                'add_continual': item_add_continual_feat,
+            }
+        seq_feat = item_feat()
+        seq_feat.update(item_add_feat())
+        pos_feat = item_feat()
+        neg_feat = item_feat(self.sample_neg_num)
 
+        if len(ext_user_sequence) == 0:
+            seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
+            pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
+            neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
+
+            return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
+
+            
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
 
-        ts = set()
-        for record_tuple in ext_user_sequence:
-            if record_tuple[2] == 1 and record_tuple[0]:
-                ts.add(record_tuple[0])
+        # for record_tuple in ext_user_sequence:
+        #     if record_tuple[2] == 1 and record_tuple[0]:
+        #         ts.add(record_tuple[0])
 
         # left-padding, 从后往前遍历，将用户序列填充到maxlen+1的长度
         for record_tuple in reversed(ext_user_sequence[:-1]):
@@ -495,17 +438,14 @@ class MyDataset(torch.utils.data.Dataset):
             feat['1303'] = (hour + 1) if timestamp > 0 else 0      # 1..24
             feat['1304'] = 0  # 先置0，占位，循环结束后回填正确分桶
             feat['1305'] = np.log1p(max_timestamp - timestamp)
+
             if type_ == 1:
-                item_stats = self.get_item_statistics(i, timestamp)
-                feat['1401'] = item_stats['prev_hour_exposure_users']
-                feat['1402'] = item_stats['prev_hour_click_users']
-                feat['1403'] = item_stats['prev_24h_exposure_users']
-                feat['1404'] = item_stats['prev_24h_click_users']
-                feat['1405'] = item_stats['all_time_exposure_users']
-                feat['1406'] = item_stats['all_time_click_users']
+                feat['1306'] = np.searchsorted(self._tdelta_edges, next_timestamp - timestamp, side='right')
                 if act_type is None:
                     act_type = -1
                 feat['1501'] = act_type + 1
+            
+
             seq_feat[idx] = feat
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
@@ -550,12 +490,6 @@ class MyDataset(torch.utils.data.Dataset):
             if isinstance(seq_feat[t], dict):
                 c = int(cats[t])
                 seq_feat[t]['1304'] = c
-                # 统计：仅对item记录计数（包含padding=0、零间隔=1、其余=2..）
-                if tt_np[t] == 1:
-                    idx = c
-                    if 0 <= idx < self._tdelta_bucket_counts.shape[0]:
-                        self._tdelta_bucket_counts[idx] += 1
-                    self._tdelta_total += 1
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
         neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
 
@@ -570,21 +504,6 @@ class MyDataset(torch.utils.data.Dataset):
         """
         return len(self.seq_offsets)
 
-    def report_time_delta_hist(self):
-        """
-        打印时间间隔分桶的频率统计（占比）。
-        0: padding/首个item；1: 真实零间隔；2..: 固定边界桶。
-        """
-        if getattr(self, '_tdelta_total', 0) == 0:
-            print('[time-delta] no samples counted yet')
-            return
-        total = max(1, int(self._tdelta_total))
-        counts = self._tdelta_bucket_counts[:]
-        # 输出前若干桶的占比
-        print('[time-delta] bucket ratios:')
-        for i, c in enumerate(counts):
-            ratio = float(c) / total
-            print(f'  bucket {i}: count={int(c)} ratio={ratio:.6f}')
 
     def _init_feat_info(self):
         """
@@ -597,7 +516,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value = {}
         feat_statistics = {}
         feat_types = {}
-        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304', '1501']
+        feat_types['user_sparse'] = ['103', '104', '105', '109']
         feat_types['item_sparse'] = [
             '100',
             '117',
@@ -618,12 +537,14 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
-        feat_types['user_continual'] = ['1305']
+        feat_types['user_continual'] = []
         # 连续型特征
         feat_types['item_continual'] = []
         # 将时间特征改为稀疏特征（整数类别），使用数字型特征ID
         # 约定：1301-月份，1302-星期，1303-小时，1304-时间差分桶
         # 时间特征同时用于用户和物品
+        feat_types['item_add_sparse'] = ['1301', '1302', '1303', '1304', '1306', '1501']
+        feat_types['item_add_continual'] = ['1305']
 
         for feat_id in feat_types['user_sparse']:
             feat_default_value[feat_id] = 0
@@ -649,6 +570,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value['1302'] = 0
         feat_default_value['1303'] = 0
         feat_default_value['1304'] = 0
+        feat_default_value['1306'] = 0
         feat_default_value['1501'] = 0
         feat_statistics['1301'] = 12
         feat_statistics['1302'] = 7
@@ -656,6 +578,7 @@ class MyDataset(torch.utils.data.Dataset):
         # t_delta 使用固定边界分桶：非零桶 = 1(零间隔) + len(edges) + 1(>max边界)
         # 当前 edges=20 → 非零桶=22（+0 padding）
         feat_statistics['1304'] = 22
+        feat_statistics['1306'] = 22
         feat_statistics['1501'] = 2
         for feat_id in feat_types['item_emb']:
             feat_default_value[feat_id] = np.zeros(
@@ -905,9 +828,23 @@ class MyTestDataset(MyDataset):
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
 
+        max_timestamp = 0
+        user_timestamp = 0
+        for record in reversed(user_sequence):
+            u, i, user_feat, item_feat, action_type, timestamp = record
+            max_timestamp = max(max_timestamp, timestamp)
+            if u and user_feat:
+                user_timestamp = timestamp
+                if max_timestamp != 0 or user_timestamp != 0:
+                    break
+        if user_timestamp != 0:
+            max_timestamp = user_timestamp
+
         ext_user_sequence = []
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, _, timestamp = record_tuple
+            if timestamp > max_timestamp:
+                continue
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id
                     user_id = u
@@ -918,7 +855,7 @@ class MyTestDataset(MyDataset):
                     u = 0
                 if user_feat:
                     user_feat = self._process_cold_start_feat(user_feat)
-                ext_user_sequence.insert(0, (u, user_feat, 2, timestamp))
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, max_timestamp))
 
             if i and item_feat:
                 # 序列对于训练时没见过的item，不会直接赋0，而是保留creative_id，creative_id远大于训练时的itemnum
@@ -926,7 +863,7 @@ class MyTestDataset(MyDataset):
                     i = 0
                 if item_feat:
                     item_feat = self._process_cold_start_feat(item_feat)
-                ext_user_sequence.append((i, item_feat, 1, timestamp))
+                ext_user_sequence.append((i, item_feat, 1, action_type, timestamp))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         token_type = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -940,8 +877,9 @@ class MyTestDataset(MyDataset):
             if record_tuple[2] == 1 and record_tuple[0]:
                 ts.add(record_tuple[0])
 
+        next_timestamp = max_timestamp
         for record_tuple in reversed(ext_user_sequence[:]):
-            i, feat, type_,timestamp = record_tuple
+            i, feat, type_, action_type, timestamp = record_tuple
             feat = self.fill_missing_feat(feat, i)
             # 添加时间稀疏特征（与训练集一致，保留0作为padding）
             # 时间特征同时用于用户和物品
@@ -953,10 +891,17 @@ class MyTestDataset(MyDataset):
             feat['1302'] = (weekday + 1) if timestamp > 0 else 0  # 1..7
             feat['1303'] = (hour + 1) if timestamp > 0 else 0      # 1..24
             feat['1304'] = 0  # 先置0，占位，循环结束后回填正确分桶
+            feat['1305'] = np.log1p(max_timestamp - timestamp)
+            if type_ == 1:
+                feat['1306'] = np.searchsorted(self._tdelta_edges, next_timestamp - timestamp, side='right')
+                if act_type is None:
+                    act_type = -1
+                feat['1501'] = act_type + 1
             seq[idx] = i
             seq_timestamp[idx] = timestamp
             token_type[idx] = type_
             seq_feat[idx] = feat
+            next_timestamp = timestamp
             idx -= 1
             if idx == -1:
                 break

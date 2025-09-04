@@ -121,7 +121,7 @@ def get_args():
     parser.add_argument('--warmup_steps', default=1000, type=int, help='Warmup步数')
     parser.add_argument('--warmup_lr', default=1e-6, type=float, help='Warmup起始学习率')
     parser.add_argument('--min_lr', default=1e-7, type=float, help='最小学习率')
-
+    
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
     
@@ -310,7 +310,7 @@ if __name__ == '__main__':
             if step % args.print_freq == 0:
                 elapsed_str = _format_elapsed(time.time() - t0)
                 log_json = json.dumps(
-                    {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str, 'acc': acc.item(), 'click_acc': future_click_acc},
+                    {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': elapsed_str, 'acc': acc, 'click_acc': future_click_acc},
                     ensure_ascii=False,
                 )
                 print(log_json)
@@ -429,9 +429,9 @@ if __name__ == '__main__':
                     selected_masks = pos_mask[indices]
                     loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
                 valid_loss_sum += loss.item()
-                valid_acc_sum += acc.item()
-                valid_pos_sim_sum += pos_sim.item()
-                valid_neg_sim_sum += neg_sim.item()
+                valid_acc_sum += acc
+                valid_pos_sim_sum += pos_sim
+                valid_neg_sim_sum += neg_sim
                 valid_future_click_acc_sum += future_click_acc
                 # print(f"Valid Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
                 # print(f"Valid Reserved:  {torch.cuda.memory_reserved() / 1024**2:.2f} MB")

@@ -24,6 +24,13 @@ def set_seed(seed=42, deterministic=True):
         torch.backends.cudnn.benchmark = False
     print(f"Random seed set as {seed}")
 
+def seed_worker(worker_id):
+    np.random.seed(42 + worker_id)
+    random.seed(42 + worker_id)
+    torch.manual_seed(42 + worker_id)
+    # 若使用CUDA，还需设置cuda种子
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42 + worker_id)
 
 def get_ckpt_path():
     ckpt_path = os.environ.get("MODEL_OUTPUT_PATH")
@@ -56,11 +63,13 @@ def get_args():
     parser.add_argument('--use_hstu_attn', action='store_true')
     parser.add_argument('--concat_ua', action='store_false')
     parser.add_argument('--use_all_in_batch', action='store_true')
+    parser.add_argument('--sample_neg_num',  default=1, type=int)
+    parser.add_argument('--skip_mm_emb', action='store_false')
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
 
-    test_arg=["--hidden_units","128","--num_blocks","3","--num_heads","8" "--use_hstu_attn"]
+    test_arg=["--hidden_units","128","--num_blocks","6","--num_heads","8", "--use_hstu_attn","--use_all_in_batch","--norm_first"]
 
     args = parser.parse_args(test_arg)
 
@@ -82,6 +91,74 @@ def read_result_ids(file_path):
         result_ids = np.fromfile(f, dtype=np.uint64, count=num_result_ids)
 
         return result_ids.reshape((num_points_query, query_ann_top_k))
+def _read_fbin(file_path: Path, dtype: np.dtype) -> np.ndarray:
+    with open(file_path, 'rb') as f:
+        num_points = struct.unpack('I', f.read(4))[0]
+        num_dims = struct.unpack('I', f.read(4))[0]
+        arr = np.fromfile(f, dtype=dtype, count=num_points * num_dims)
+    return arr.reshape(num_points, num_dims)
+
+
+def _write_result_ids(file_path: Path, result_ids: np.ndarray, top_k: int) -> None:
+    assert result_ids.dtype == np.uint64 and result_ids.ndim == 2 and result_ids.shape[1] == top_k
+    num_points = result_ids.shape[0]
+    with open(file_path, 'wb') as f:
+        f.write(struct.pack('I', num_points))
+        f.write(struct.pack('I', top_k))
+        result_ids.tofile(f)
+
+
+@torch.no_grad()
+def _ann_topk_inner_product(
+    queries: torch.Tensor,
+    database: torch.Tensor,
+    db_ids: np.ndarray,
+    top_k: int,
+    db_block_size: int = 200_000,
+    query_block_size: int = 8192,
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+) -> np.ndarray:
+    """
+    Batched top-k retrieval by inner product (dot product) using Torch matmul.
+
+    Note: If inputs are L2-normalized, this is equivalent to cosine similarity.
+    """
+    Q, dim = queries.shape
+    N, dim_db = database.shape
+    assert dim == dim_db
+
+    result_blocks = []
+    for q_start in range(0, Q, query_block_size):
+        q_end = min(q_start + query_block_size, Q)
+        q_block = queries[q_start:q_end].to(device)
+
+        qb = q_block.shape[0]
+        best_scores = torch.full((qb, top_k), -1e9, device=device)
+        best_indices = torch.full((qb, top_k), -1, dtype=torch.long, device=device)
+
+        for d_start in range(0, N, db_block_size):
+            d_end = min(d_start + db_block_size, N)
+            d_block = database[d_start:d_end].to(device)
+            scores = torch.matmul(q_block, d_block.T)
+            blk_scores, blk_idx = torch.topk(scores, k=min(top_k, scores.shape[1]), dim=1)
+            blk_idx = blk_idx + d_start
+
+            merged_scores = torch.cat([best_scores, blk_scores], dim=1)
+            merged_indices = torch.cat([best_indices, blk_idx], dim=1)
+            best_scores, top_idx = torch.topk(merged_scores, k=top_k, dim=1)
+            best_indices = torch.gather(merged_indices, 1, top_idx)
+
+            del scores, blk_scores, blk_idx, merged_scores, merged_indices, top_idx, d_block
+            torch.cuda.empty_cache() if device.startswith('cuda') else None
+
+        best_indices_cpu = best_indices.detach().cpu().numpy()
+        result_ids_block = db_ids[best_indices_cpu, 0].astype(np.uint64)
+        result_blocks.append(result_ids_block)
+
+        del q_block, best_scores, best_indices
+        torch.cuda.empty_cache() if device.startswith('cuda') else None
+
+    return np.vstack(result_blocks) if len(result_blocks) > 1 else result_blocks[0]
 
 
 def process_cold_start_feat(feat):
@@ -160,9 +237,11 @@ def infer():
     set_seed(42)
     args = get_args()
     data_path = os.environ.get('EVAL_DATA_PATH')
+    args.save_path = os.environ.get('USER_CACHE_PATH')
+    print(args)
     test_dataset = MyTestDataset(data_path, args)
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=test_dataset.collate_fn
+        test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=16, collate_fn=test_dataset.collate_fn, worker_init_fn=seed_worker
     )
     usernum, itemnum = test_dataset.usernum, test_dataset.itemnum
     feat_statistics, feat_types = test_dataset.feat_statistics, test_dataset.feature_types
@@ -175,11 +254,11 @@ def infer():
     user_list = []
     for step, batch in tqdm(enumerate(test_loader), total=len(test_loader)):
 
-        seq, token_type, seq_feat, user_id = batch
+        seq, token_type, seq_feat, user_id, seq_timestamp = batch
         seq = seq.to(args.device)
-        # 【batch, hidden_unit]
-        logits = model.predict(seq, seq_feat, token_type)
-        # logits = F.normalize(logits, dim=-1)
+        # [batch, hidden_unit]
+        logits = model.predict(seq, seq_feat, token_type, seq_timestamp)
+        logits = F.normalize(logits, dim=-1)
         for i in range(logits.shape[0]):
             emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
             all_embs.append(emb)
@@ -196,20 +275,27 @@ def infer():
     all_embs = np.concatenate(all_embs, axis=0)
     # 保存query文件
     save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
-    # ANN 检索
-    ann_cmd = (
-        str(Path("/workspace", "faiss-based-ann", "faiss_demo"))
-        + " --dataset_vector_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin"))
-        + " --dataset_id_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id.u64bin"))
-        + " --query_vector_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "query.fbin"))
-        + " --result_id_file_path="
-        + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
-        + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
+    # Torch 矩阵乘法 ANN 检索（替代CPU/FAISS路径，输出与原格式一致）
+    result_dir = Path(os.environ.get('EVAL_RESULT_PATH'))
+    db_vecs = _read_fbin(result_dir / 'embedding.fbin', np.float32)
+    db_ids = _read_fbin(result_dir / 'id.u64bin', np.uint64)
+    queries = _read_fbin(result_dir / 'query.fbin', np.float32)
+
+    device = os.environ.get('TORCH_ANN_DEVICE', 'cuda' if torch.cuda.is_available() else 'cpu')
+    top_k = 10
+    db_block_size = int(os.environ.get('DB_BLOCK_SIZE', '200000'))
+    query_block_size = int(os.environ.get('QUERY_BLOCK_SIZE', '8192'))
+
+    result_ids = _ann_topk_inner_product(
+        queries=torch.from_numpy(queries),
+        database=torch.from_numpy(db_vecs),
+        db_ids=db_ids,
+        top_k=top_k,
+        db_block_size=db_block_size,
+        query_block_size=query_block_size,
+        device=device,
     )
-    os.system(ann_cmd)
+    _write_result_ids(result_dir / 'id100.u64bin', result_ids, top_k)
 
     # 取出top-k
     top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
@@ -221,3 +307,11 @@ def infer():
     top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
 
     return top10s, user_list
+
+def __main__():
+    top10s, user_list = infer()
+    print(top10s)
+    print(user_list)
+
+if __name__ == "__main__":
+    __main__()
