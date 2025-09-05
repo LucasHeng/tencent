@@ -450,16 +450,31 @@ class MyDataset(torch.utils.data.Dataset):
             neg_feat: 负样本特征，每个元素为字典，key为特征ID，value为特征值
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
+        
 
         ext_user_sequence = []
         max_timestamp = 0
+        user_timestamp = 0
+        for record in reversed(user_sequence):
+            u, i, user_feat, item_feat, action_type, timestamp = record
+            max_timestamp = max(max_timestamp, timestamp)
+            if u and user_feat:
+                user_timestamp = timestamp
+                if max_timestamp != 0 or user_timestamp != 0:
+                    break
+        if user_timestamp != 0:
+            max_timestamp = user_timestamp
+            
+        ts = set()
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, timestamp = record_tuple
+            if timestamp > max_timestamp:
+                continue
             if u and user_feat:
-                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, timestamp))
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, max_timestamp))
             if i and item_feat:
+                ts.add(i)
                 ext_user_sequence.append((i, item_feat, 1, action_type, timestamp))
-            max_timestamp = max(max_timestamp, timestamp)
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
         pos = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -473,13 +488,20 @@ class MyDataset(torch.utils.data.Dataset):
         pos_feat = np.empty([self.maxlen + 1], dtype=object)
         neg_feat = np.empty([self.maxlen + 1, self.sample_neg_num], dtype=object)
 
+        if len(ext_user_sequence) == 0:
+            seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
+            pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
+            neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
+
+            return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
+
+            
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
 
-        ts = set()
-        for record_tuple in ext_user_sequence:
-            if record_tuple[2] == 1 and record_tuple[0]:
-                ts.add(record_tuple[0])
+        # for record_tuple in ext_user_sequence:
+        #     if record_tuple[2] == 1 and record_tuple[0]:
+        #         ts.add(record_tuple[0])
 
         # left-padding, 从后往前遍历，将用户序列填充到maxlen+1的长度
         for record_tuple in reversed(ext_user_sequence[:-1]):
@@ -505,6 +527,7 @@ class MyDataset(torch.utils.data.Dataset):
             feat['1304'] = 0  # 先置0，占位，循环结束后回填正确分桶
             feat['1305'] = np.log1p(max_timestamp - timestamp)
             if type_ == 1:
+                feat['1306'] = np.searchsorted(self._tdelta_edges, next_timestamp - timestamp, side='right')
                 item_stats = self.get_item_statistics(i, timestamp)
                 feat['1401'] = item_stats['prev_hour_exposure_users']
                 feat['1402'] = item_stats['prev_hour_click_users']
@@ -606,7 +629,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value = {}
         feat_statistics = {}
         feat_types = {}
-        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304', '1501']
+        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304', '1306','1501']
         feat_types['item_sparse'] = [
             '100',
             '117',
@@ -658,6 +681,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value['1302'] = 0
         feat_default_value['1303'] = 0
         feat_default_value['1304'] = 0
+        feat_default_value['1306'] = 0
         feat_default_value['1501'] = 0
         feat_statistics['1301'] = 12
         feat_statistics['1302'] = 7
@@ -665,6 +689,7 @@ class MyDataset(torch.utils.data.Dataset):
         # t_delta 使用固定边界分桶：非零桶 = 1(零间隔) + len(edges) + 1(>max边界)
         # 当前 edges=20 → 非零桶=22（+0 padding）
         feat_statistics['1304'] = 22
+        feat_statistics['1306'] = 22
         feat_statistics['1501'] = 2
         for feat_id in feat_types['item_emb']:
             feat_default_value[feat_id] = np.zeros(
