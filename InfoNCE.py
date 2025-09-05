@@ -81,6 +81,7 @@ def info_nce(query, positive_key, negative_keys=None, next_action_type=None, tem
 
     query, positive_key, negative_keys = normalize(query, positive_key, negative_keys)
     
+    S = query.shape[0]
     positive_logit = torch.sum(query * positive_key, dim=1, keepdim=True)
     negative_keys = negative_keys.reshape(-1, negative_keys.shape[-1])
     negative_logits = query @ transpose(negative_keys)

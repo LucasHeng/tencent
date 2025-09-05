@@ -6,8 +6,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
-from collections import defaultdict, Counter
-import psutil
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -40,7 +38,6 @@ class MyDataset(torch.utils.data.Dataset):
         """
         super().__init__()
         self.data_dir = Path(data_dir)
-        self.save_path = args.save_path
         self._load_data_and_offsets()
         self.maxlen = args.maxlen
         if args.skip_mm_emb:
@@ -62,17 +59,6 @@ class MyDataset(torch.utils.data.Dataset):
         self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-        
-        item_sparse_dict = {k: self.feat_statistics[k] for k in self.feature_types['item_sparse']}
-        print(f'item_spase: {item_sparse_dict}')
-        item_array_dict = {k: self.feat_statistics[k] for k in self.feature_types['item_array']}
-        print(f'item_array: {item_array_dict}')
-        user_sparse_dict = {k: self.feat_statistics[k] for k in self.feature_types['user_sparse']}
-        print(f'user_sparse: {user_sparse_dict}')
-        user_array_dict = {k: self.feat_statistics[k] for k in self.feature_types['user_array']}
-        print(f'user_array: {user_array_dict}')
-        
-        print(f'self.feat_statistics {self.feat_statistics}')
         # 统计时间间隔分桶：类别0为padding，1为零间隔，2..为各边界桶
         try:
             self._tdelta_bucket_counts = np.zeros(int(self._safe_feat_stat('1304')) + 1, dtype=np.int64)
@@ -86,130 +72,6 @@ class MyDataset(torch.utils.data.Dataset):
             43200, 64800, 86400, 129600, 172800,
             259200, 432000, 604800, 1209600
         ], dtype=np.int64)
-
-
-        if self.stats_file_path.exists() and self.offsets_file_path.exists():
-            print(f"发现新格式的统计信息文件: {self.stats_file_path}")
-            self._load_offsets()
-        else:
-            print("未发现缓存的统计信息，开始处理数据...")
-            self.process_data()
-        
-
-    def _load_offsets(self):
-        """
-        加载offset索引
-        """
-        if self.offsets_file_path and self.offsets_file_path.exists():
-            with open(self.offsets_file_path, 'rb') as f:
-                self.item_offsets = pickle.load(f)
-            print(f"已加载 {len(self.item_offsets)} 个item的offset索引")
-        else:
-            print("未找到offset索引文件")
-
-    def timestamp_to_hour_stamp(self, timestamp):
-        """
-        将时间戳转换为小时时间戳
-        
-        Args:
-            timestamp: Unix时间戳
-            
-        Returns:
-            hour_stamp: 小时时间戳（Unix时间戳向下取整到小时）
-        """
-        # 向下取整到小时
-        return (timestamp // 3600) * 3600
-
-    def process_data(self):
-        """
-        处理数据，构建按小时的统计信息并保存到文件
-        """
-        print("开始处理item统计信息...")
-        
-        # 加载数据
-        seq_file = self.data_dir / "seq.jsonl"
-        
-        # 临时存储统计信息（处理完成后写入文件）
-        temp_stats = defaultdict(lambda: defaultdict(lambda: {'exposure_users': [], 'click_users': []}))
-
-        # 流式处理数据，避免一次性加载所有记录到内存
-        record_count = 0
-        with open(seq_file, 'r') as f:
-            for line_num, line in enumerate(tqdm(f, desc="处理用户序列")):
-                user_sequence = json.loads(line.strip())
-                for record in user_sequence:
-                    user_id, item_id, user_feat, item_feat, action_type, timestamp = record
-                    if item_id is not None and user_id is not None:
-                        # 直接处理记录，不存储在内存中
-                        hour_stamp = self.timestamp_to_hour_stamp(timestamp)
-                        
-                        # 更新该小时的统计信息
-                        if user_id not in temp_stats[item_id][hour_stamp]['exposure_users']:
-                            temp_stats[item_id][hour_stamp]['exposure_users'].append(user_id)
-                        
-                        if action_type == 1:  # 点击
-                            if user_id not in temp_stats[item_id][hour_stamp]['click_users']:
-                                temp_stats[item_id][hour_stamp]['click_users'].append(user_id)
-                        
-                        record_count += 1
-                        
-        print(f"总记录数: {record_count}")
-        
-        # 将统计信息写入文件并创建offset索引
-        self._save_stats_to_file(temp_stats)
-        
-        # 清理临时数据
-        del temp_stats
-        
-        print(f"处理完成！")
-        
-        # 打印内存使用情况
-        memory_usage = self._get_memory_usage()
-        print(f"最终内存使用: {memory_usage:.2f}MB")
-
-    def _get_memory_usage(self):
-        """获取当前内存使用情况（MB）"""
-        try:
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            return memory_info.rss / 1024 / 1024
-        except:
-            return 0
-
-    def _save_stats_to_file(self, temp_stats):
-        """
-        将统计信息保存到文件并创建offset索引
-        """
-        print("将统计信息写入文件...")
-        self.item_offsets = {}
-        # 写入统计信息文件
-        with open(self.stats_file_path, 'w') as f:
-            for item_id, hours in tqdm(temp_stats.items(), desc="写入统计信息"):
-                # 记录当前item的offset
-                self.item_offsets[item_id] = f.tell()
-                
-                # 写入item的统计信息
-                item_data = {
-                    'item_id': item_id,
-                    'stats': {}
-                }
-                
-                for hour_stamp, stats in hours.items():
-                    item_data['stats'][str(hour_stamp)] = {
-                        'exposure_users': stats['exposure_users'],
-                        'click_users': stats['click_users']
-                    }
-                
-                f.write(json.dumps(item_data, ensure_ascii=False) + '\n')
-        
-        # 保存offset索引
-        with open(self.offsets_file_path, 'wb') as f:
-            pickle.dump(self.item_offsets, f)
-        
-        print(f"统计信息已保存到: {self.stats_file_path}")
-        print(f"Offset索引已保存到: {self.offsets_file_path}")
-        print(f"总item数: {len(self.item_offsets)}")
-
 
     def _safe_feat_stat(self, k):
         return self._get_feat_stat(self._ensure_feat_stats(), k)
@@ -231,10 +93,6 @@ class MyDataset(torch.utils.data.Dataset):
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
 
-        self.stats_file_path = Path(self.save_path) / "item_stats.jsonl"
-        self.offsets_file_path = Path(self.save_path) / "item_stats_offsets.pkl"
-
-        
     def _ensure_data_file_open(self):
         # 在每个worker内懒加载独立的文件句柄，避免文件指针冲突
         if getattr(self, 'data_file', None) is None:
@@ -290,148 +148,6 @@ class MyDataset(torch.utils.data.Dataset):
             neg_samps.append(t)
         return neg_samps
 
-    def _load_item_stats_from_file(self, item_id):
-        """
-        从文件加载指定item的统计信息
-        
-        Args:
-            item_id: 物品ID
-            
-        Returns:
-            dict: item的统计信息，如果不存在返回None
-        """
-        if item_id not in self.item_offsets:
-            return None
-        
-        # 在每个worker内懒加载独立的文件句柄，避免文件指针冲突
-        if getattr(self, 'stats_file', None) is None:
-            self.stats_file = open(self.stats_file_path, 'r')
-        
-        try:
-            # 定位到指定item的位置
-            self.stats_file.seek(self.item_offsets[item_id])
-            
-            # 读取一行
-            line = self.stats_file.readline()
-            if line:
-                item_data = json.loads(line.strip())
-                return item_data.get('stats', {})
-        except Exception as e:
-            print(f"读取item {item_id} 统计信息失败: {e}")
-            return None
-        
-        return None
-
-    def get_item_statistics(self, item_id, timestamp, max_users=10):
-        """
-        获取指定item在指定时间戳的统计信息
-        
-        Args:
-            item_id: 物品ID
-            timestamp: 时间戳
-            max_users: 每个时间窗口最多返回的用户数量，默认10
-            
-        Returns:
-            dict: 包含统计信息的字典
-        """
-        target_hour =  (timestamp // 3600) * 3600
-        
-        # 从文件加载item的统计信息
-        item_stats = self._load_item_stats_from_file(item_id)
-        if not item_stats:
-            return {
-                'prev_hour_exposure_users': [],
-                'prev_hour_click_users': [],
-                'prev_24h_exposure_users': [],
-                'prev_24h_click_users': [],
-                'all_time_exposure_users': [],
-                'all_time_click_users': []
-            }
-        
-        # 获取前1小时、前24小时、之前所有时间的用户
-        stats = {
-            'prev_hour_exposure_users': [],
-            'prev_hour_click_users': [],
-            'prev_24h_exposure_users': [],
-            'prev_24h_click_users': [],
-            'all_time_exposure_users': [],
-            'all_time_click_users': []
-        }
-        
-        # 前1小时
-        prev_hour = target_hour - 3600
-        if str(prev_hour) in item_stats:
-            hour_stats = item_stats[str(prev_hour)]
-            exposure_users = hour_stats['exposure_users']
-            click_users = hour_stats['click_users']
-            
-            # 统计用户出现次数，选择出现次数最多的用户
-            exposure_counter = Counter()
-            click_counter = Counter()
-            
-            exposure_counter.update(exposure_users)
-            click_counter.update(click_users)
-            
-            # 选择出现次数最多的用户，如果次数相同则按用户ID排序
-            top_exposure_users = [user for user, _ in exposure_counter.most_common(max_users)]
-            top_click_users = [user for user, _ in click_counter.most_common(max_users)]
-            
-            stats['prev_hour_exposure_users'] = top_exposure_users
-            stats['prev_hour_click_users'] = top_click_users
-        
-        # 前24小时（最近24小时，不包括当前小时）
-        prev_24h_start = target_hour - 24 * 3600
-        prev_24h_exposure_users = []
-        prev_24h_click_users = []
-        
-        # 收集前24小时的所有用户，按时间顺序（从早到晚）
-        for hour_stamp in range(prev_24h_start, target_hour, 3600):
-            if str(hour_stamp) in item_stats:
-                hour_stats = item_stats[str(hour_stamp)]
-                prev_24h_exposure_users.extend(hour_stats['exposure_users'])
-                prev_24h_click_users.extend(hour_stats['click_users'])
-        
-        # 统计用户出现次数，选择出现次数最多的用户
-        prev_24h_exposure_counter = Counter()
-        prev_24h_click_counter = Counter()
-        
-        prev_24h_exposure_counter.update(prev_24h_exposure_users)
-        prev_24h_click_counter.update(prev_24h_click_users)
-        
-        # 选择出现次数最多的用户，如果次数相同则按用户ID排序
-        top_prev_24h_exposure_users = [user for user, _ in prev_24h_exposure_counter.most_common(max_users)]
-        top_prev_24h_click_users = [user for user, _ in prev_24h_click_counter.most_common(max_users)]
-        
-        stats['prev_24h_exposure_users'] = top_prev_24h_exposure_users
-        stats['prev_24h_click_users'] = top_prev_24h_click_users
-        
-        # 之前所有时间（不包括当前时间戳所在的小时）
-        all_exposure_users = []
-        all_click_users = []
-        
-        # 收集所有历史用户（不需要按时间顺序，因为Counter只关心出现次数）
-        for hour_stamp in item_stats.keys():
-            if int(hour_stamp) < target_hour:  # 只包括严格小于当前小时的数据
-                hour_stats = item_stats[hour_stamp]
-                all_exposure_users.extend(hour_stats['exposure_users'])
-                all_click_users.extend(hour_stats['click_users'])
-        
-        # 统计用户出现次数，选择出现次数最多的用户
-        all_exposure_counter = Counter()
-        all_click_counter = Counter()
-        
-        all_exposure_counter.update(all_exposure_users)
-        all_click_counter.update(all_click_users)
-        
-        # 选择出现次数最多的用户，如果次数相同则按用户ID排序
-        top_all_exposure_users = [user for user, _ in all_exposure_counter.most_common(max_users)]
-        top_all_click_users = [user for user, _ in all_click_counter.most_common(max_users)]
-        
-        stats['all_time_exposure_users'] = top_all_exposure_users
-        stats['all_time_click_users'] = top_all_click_users
-        
-        return stats
-
     def __getitem__(self, uid):
         """
         获取单个用户的数据，并进行padding处理，生成模型需要的数据格式
@@ -450,30 +166,13 @@ class MyDataset(torch.utils.data.Dataset):
             neg_feat: 负样本特征，每个元素为字典，key为特征ID，value为特征值
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
-        
 
         ext_user_sequence = []
-        max_timestamp = 0
-        user_timestamp = 0
-        for record in reversed(user_sequence):
-            u, i, user_feat, item_feat, action_type, timestamp = record
-            max_timestamp = max(max_timestamp, timestamp)
-            if u and user_feat:
-                user_timestamp = timestamp
-                if max_timestamp != 0 or user_timestamp != 0:
-                    break
-        if user_timestamp != 0:
-            max_timestamp = user_timestamp
-            
-        ts = set()
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, timestamp = record_tuple
-            if timestamp > max_timestamp:
-                continue
             if u and user_feat:
-                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, max_timestamp))
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type, timestamp))
             if i and item_feat:
-                ts.add(i)
                 ext_user_sequence.append((i, item_feat, 1, action_type, timestamp))
 
         seq = np.zeros([self.maxlen + 1], dtype=np.int32)
@@ -488,20 +187,13 @@ class MyDataset(torch.utils.data.Dataset):
         pos_feat = np.empty([self.maxlen + 1], dtype=object)
         neg_feat = np.empty([self.maxlen + 1, self.sample_neg_num], dtype=object)
 
-        if len(ext_user_sequence) == 0:
-            seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
-            pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
-            neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
-
-            return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
-
-            
         nxt = ext_user_sequence[-1]
         idx = self.maxlen
 
-        # for record_tuple in ext_user_sequence:
-        #     if record_tuple[2] == 1 and record_tuple[0]:
-        #         ts.add(record_tuple[0])
+        ts = set()
+        for record_tuple in ext_user_sequence:
+            if record_tuple[2] == 1 and record_tuple[0]:
+                ts.add(record_tuple[0])
 
         # left-padding, 从后往前遍历，将用户序列填充到maxlen+1的长度
         for record_tuple in reversed(ext_user_sequence[:-1]):
@@ -525,19 +217,6 @@ class MyDataset(torch.utils.data.Dataset):
             feat['1302'] = (weekday + 1) if timestamp > 0 else 0  # 1..7
             feat['1303'] = (hour + 1) if timestamp > 0 else 0      # 1..24
             feat['1304'] = 0  # 先置0，占位，循环结束后回填正确分桶
-            feat['1305'] = np.log1p(max_timestamp - timestamp)
-            if type_ == 1:
-                feat['1306'] = np.searchsorted(self._tdelta_edges, next_timestamp - timestamp, side='right')
-                item_stats = self.get_item_statistics(i, timestamp)
-                feat['1401'] = item_stats['prev_hour_exposure_users']
-                feat['1402'] = item_stats['prev_hour_click_users']
-                feat['1403'] = item_stats['prev_24h_exposure_users']
-                feat['1404'] = item_stats['prev_24h_click_users']
-                feat['1405'] = item_stats['all_time_exposure_users']
-                feat['1406'] = item_stats['all_time_click_users']
-                if act_type is None:
-                    act_type = -1
-                feat['1501'] = act_type + 1
             seq_feat[idx] = feat
             if next_type == 1 and next_i != 0:
                 pos[idx] = next_i
@@ -629,7 +308,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_default_value = {}
         feat_statistics = {}
         feat_types = {}
-        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304', '1306','1501']
+        feat_types['user_sparse'] = ['103', '104', '105', '109', '1301', '1302', '1303', '1304']
         feat_types['item_sparse'] = [
             '100',
             '117',
@@ -646,11 +325,10 @@ class MyDataset(torch.utils.data.Dataset):
             '122',
             '116',
         ]
-        feat_types['user_stats_array'] = ['1401', '1402', '1403', '1404','1405','1406']
         feat_types['item_array'] = []
         feat_types['user_array'] = ['106', '107', '108', '110']
         feat_types['item_emb'] = self.mm_emb_ids
-        feat_types['user_continual'] = ['1305']
+        feat_types['user_continual'] = []
         # 连续型特征
         feat_types['item_continual'] = []
         # 将时间特征改为稀疏特征（整数类别），使用数字型特征ID
@@ -673,24 +351,17 @@ class MyDataset(torch.utils.data.Dataset):
             feat_default_value[feat_id] = 0
         for feat_id in feat_types['item_continual']:
             feat_default_value[feat_id] = 0
-        for feat_id in feat_types['user_stats_array']:
-            feat_default_value[feat_id] = [0]
-            feat_statistics[feat_id] = self.usernum
         # 为新增稀疏时间特征设置默认值与词表大小（数值型ID）
         feat_default_value['1301'] = 0
         feat_default_value['1302'] = 0
         feat_default_value['1303'] = 0
         feat_default_value['1304'] = 0
-        feat_default_value['1306'] = 0
-        feat_default_value['1501'] = 0
         feat_statistics['1301'] = 12
         feat_statistics['1302'] = 7
         feat_statistics['1303'] = 24
         # t_delta 使用固定边界分桶：非零桶 = 1(零间隔) + len(edges) + 1(>max边界)
         # 当前 edges=20 → 非零桶=22（+0 padding）
         feat_statistics['1304'] = 22
-        feat_statistics['1306'] = 22
-        feat_statistics['1501'] = 2
         for feat_id in feat_types['item_emb']:
             feat_default_value[feat_id] = np.zeros(
                 list(self.mm_emb_dict[feat_id].values())[0].shape[0], dtype=np.float32
@@ -817,7 +488,6 @@ class MyDataset(torch.utils.data.Dataset):
         seq_feat_pre.update(build_array(self.feature_types['item_array'], seq_feat_list))
         pos_feat_pre.update(build_array(self.feature_types['item_array'], pos_feat_list))
         seq_feat_pre.update(build_array(self.feature_types['user_array'], seq_feat_list))
-        seq_feat_pre.update(build_array(self.feature_types['user_stats_array'], seq_feat_list))
         # multimodal emb
         seq_feat_pre.update(build_emb(self.feature_types['item_emb'], seq_feat_list))
         pos_feat_pre.update(build_emb(self.feature_types['item_emb'], pos_feat_list))
@@ -938,9 +608,19 @@ class MyTestDataset(MyDataset):
             user_id: user_id eg. user_xxxxxx ,便于后面对照答案
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
-
+        if len(user_sequence) > self.max_length:
+            self.max_length = len(user_sequence)
+            print(f'max_length: {self.max_length}')
+        filter_user_sequence = []
+        pos = self.maxlen - 1
+        for record_tuple in reversed(user_sequence):
+            filter_user_sequence.append(record_tuple)
+            pos -= 1
+            if pos == 0:
+                break
+            
         ext_user_sequence = []
-        for record_tuple in user_sequence:
+        for record_tuple in reversed(filter_user_sequence):
             u, i, user_feat, item_feat, _, timestamp = record_tuple
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id
@@ -1113,7 +793,6 @@ class MyTestDataset(MyDataset):
         # arrays
         seq_feat_pre.update(build_array(self.feature_types['item_array'], seq_feat_list))
         seq_feat_pre.update(build_array(self.feature_types['user_array'], seq_feat_list))
-        seq_feat_pre.update(build_array(self.feature_types['user_stats_array'], seq_feat_list))
         # multimodal emb
         seq_feat_pre.update(build_emb(self.feature_types['item_emb'], seq_feat_list))
 

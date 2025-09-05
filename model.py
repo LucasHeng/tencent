@@ -11,89 +11,6 @@ import math
 
 from dataset import save_emb
 
-class Expert(nn.Module):
-    def __init__(self, n_embd, dropout=0.0):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-    
-class NoisyTopkRouter(nn.Module):
-    def __init__(self, n_embed, num_experts, top_k):
-        super(NoisyTopkRouter, self).__init__()
-        self.top_k = top_k
-        self.topkroute_linear = nn.Linear(n_embed, num_experts)
-        # add noise
-        self.noise_linear =nn.Linear(n_embed, num_experts)
-
-    
-    def forward(self, mh_output):
-        # mh_ouput is the output tensor from multihead self attention block
-        logits = self.topkroute_linear(mh_output)
-
-        #Noise logits
-        noise_logits = self.noise_linear(mh_output)
-
-        #Adding scaled unit gaussian noise to the logits
-        noise = torch.randn_like(logits)*F.softplus(noise_logits)
-        noisy_logits = logits + noise
-
-        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
-        zeros = torch.full_like(noisy_logits, float('-inf'))
-        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
-        router_output = F.softmax(sparse_logits, dim=-1)
-        return router_output, indices
-
-class SparseMoE(nn.Module):
-    def __init__(self, n_embed, num_experts, top_k, dropout=0.0, capacity_factor=1.0):
-        super(SparseMoE, self).__init__()
-        self.router = NoisyTopkRouter(n_embed, num_experts, top_k)
-        self.experts = nn.ModuleList([Expert(n_embed, dropout) for _ in range(num_experts)])
-        self.top_k = top_k
-        self.capacity_factor = capacity_factor
-        self.num_experts = num_experts
-    
-    def forward(self, x):
-        batch_size, seq_len, _ = x.shape
-        gating_output, indices = self.router(x)
-        final_output = torch.zeros_like(x)
-
-        flat_x = x.view(-1, x.size(-1))  
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
-
-        tokens_per_batch = batch_size * seq_len * self.top_k
-        # 定义专家容量
-        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
-
-        updates = torch.zeros_like(flat_x)
-
-        for i, expert in enumerate(self.experts):
-            expert_mask = (indices == i).any(dim=-1)
-            flat_mask = expert_mask.view(-1)
-            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
-            
-            # 进行容量判断
-            limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
-            if limited_indices.numel() > 0:
-                expert_input = flat_x[limited_indices]
-                expert_output = expert(expert_input)
-
-                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
-                weighted_output = expert_output * gating_scores
-
-                updates.index_add_(0, limited_indices, weighted_output)
-
-        # Reshape updates to match the original dimensions of x
-        final_output += updates.view(batch_size, seq_len, -1)
-
-        return final_output
-
 def apply_rope(x, timestamps, dim, base=10000):
     """Apply Rotary Position Embedding (RoPE) based on time differences.
     Args:
@@ -251,8 +168,7 @@ def _hstu_attention_maybe_from_cache(
     v: torch.Tensor,
     attention_mask: torch.Tensor,  # [bs, 1, n, n]
     all_timestamps: torch.Tensor,
-    rel_attn_bias: torch.nn.Module,
-    use_dot_product: bool = False,
+    rel_attn_bias: torch.nn.Module
 ):
     B, _, n, _ = attention_mask.size()
 
@@ -260,42 +176,30 @@ def _hstu_attention_maybe_from_cache(
     q_reshaped = q.view(B, n, num_heads, attention_dim)
     k_reshaped = k.view(B, n, num_heads, attention_dim)
     v_reshaped = v.view(B, n, num_heads, linear_dim)
-
+    
     # Apply time-based RoPE to q and k
     q_rope = apply_rope(q_reshaped, all_timestamps, attention_dim)
     k_rope = apply_rope(k_reshaped, all_timestamps, attention_dim)
 
-
-    if hasattr(F, 'scaled_dot_product_attention') and use_dot_product:
-        # reshape为multi-head格式
-        q_rope = q_rope.transpose(1, 2)
-        k_rope = k_rope.transpose(1, 2)
-        v_reshaped = v_reshaped.transpose(1, 2)
-        # PyTorch 2.0+ 使用内置的Flash Attention
-        attn_output = F.scaled_dot_product_attention(
-            q_rope, k_rope, v_reshaped, dropout_p=0.0, attn_mask=attention_mask
-        )
-        attn_output = attn_output.transpose(1, 2).contiguous().view(B, n, num_heads * linear_dim)
-    else:
-        # Compute attention scores with time-aware rotations
-        qk_attn = torch.einsum(
-            "bnhd,bmhd->bhnm",
-            q_rope,
-            k_rope,
-        )
+    # Compute attention scores with time-aware rotations
+    qk_attn = torch.einsum(
+        "bnhd,bmhd->bhnm",
+        q_rope,
+        k_rope,
+    )
     
-        # Add relative attention bias (if any)n
-        qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
+    # Add relative attention bias (if any)
+    qk_attn = qk_attn + rel_attn_bias(all_timestamps).unsqueeze(1)
 
-        qk_attn = F.silu(qk_attn) / n
-        qk_attn = qk_attn * attention_mask
-        
-        # Apply attention to values
-        attn_output = torch.einsum(
-            "bhnm,bmhd->bnhd",
-            qk_attn,
-            v_reshaped,
-        ).reshape(B, n, num_heads * linear_dim)
+    qk_attn = F.silu(qk_attn) / n
+    qk_attn = qk_attn * attention_mask
+    
+    # Apply attention to values
+    attn_output = torch.einsum(
+        "bhnm,bmhd->bnhd",
+        qk_attn,
+        v_reshaped,
+    ).reshape(B, n, num_heads * linear_dim)
     return attn_output
 
 class HSTUAttention(torch.nn.Module):
@@ -311,36 +215,49 @@ class HSTUAttention(torch.nn.Module):
         assert hidden_units % num_heads == 0, "hidden_units must be divisible by num_heads"
 
         self.concat_ua = concat_ua
-        self.q_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.k_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.v_linear = torch.nn.Linear(hidden_units, hidden_units)
-        self.u_linear = torch.nn.Linear(hidden_units, hidden_units)
+        self._uvqk = torch.nn.Parameter(
+            torch.empty(
+                (
+                    self.hidden_units,
+                    self.hidden_units * 4,
+                )
+            ).normal_(mean=0, std=0.02),
+        )
 
         self.out_linear = torch.nn.Linear(hidden_units, hidden_units)
         self._o = torch.nn.Linear(
             in_features=hidden_units * (3 if concat_ua else 1),
             out_features=hidden_units,
         )
+        torch.nn.init.xavier_uniform_(self._o.weight)
         self._eps = 1e-8
+
+    def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, normalized_shape=[self.hidden_units], eps=self._eps)
 
     def _norm_attn_output(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(
-            x, normalized_shape=[self.head_dim * self.num_heads], eps=self._eps
+            x, normalized_shape=[self.hidden_units], eps=self._eps
         )
 
-    def forward(self, query, key, value, all_timestamps=None, attn_mask=None):
-        batch_size, seq_len, _ = query.size()
+    def forward(self, x, all_timestamps=None, attn_mask=None):
+        batch_size, seq_len, _ = x.size()
+        
+        normed_x = self._norm_input(x)
+        # 计算qkvu
+        batched_mm_output = torch.matmul(normed_x, self._uvqk)
+        batched_mm_output = F.silu(batched_mm_output)
+        U, V, Q, K = torch.split(
+                batched_mm_output,
+                [
+                    self.hidden_units,
+                    self.hidden_units,
+                    self.hidden_units,
+                    self.hidden_units,
+                ],
+                dim=-1,
+            )
 
-        # 计算Q, K, V
-        Q = self.q_linear(query)
-        K = self.k_linear(key)
-        V = self.v_linear(value)
-        U = self.u_linear(value)
-
-        Q = F.silu(Q)
-        K = F.silu(K)
-        V = F.silu(V)
-        U = F.silu(U)
 
         attn_output = _hstu_attention_maybe_from_cache(
             num_heads=self.num_heads,
@@ -368,6 +285,7 @@ class HSTUAttention(torch.nn.Module):
                     training=self.training,
                 )
             )
+            + x
         )
         return new_outputs, None
 
@@ -431,8 +349,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: torch.Tensor,
-        all_timestamps: Optional[torch.Tensor]
+        attention_mask: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
@@ -478,9 +395,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                 q=q,
                 k=k,
                 v=v,
-                attention_mask=attention_mask.unsqueeze(1),
-                all_timestamps=all_timestamps,
-                rel_attn_bias=self._rel_attn_bias,
+                attention_mask=attention_mask
             )
 
         if self._concat_ua:
@@ -496,10 +411,11 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                     p=self._dropout_ratio,
                     training=self.training,
                 )
-            ) + x
+            )
+            + x
         )
 
-        return new_outputs, None
+        return new_outputs
 
 
 
@@ -624,7 +540,7 @@ class BaselineModel(torch.nn.Module):
         self._init_feat_info(feat_statistics, feat_types)
 
         # 用户id对应的嵌入向量 + 稀疏特征对应的嵌入向量 + 数组特征对应的嵌入向量
-        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT) + len(self.USER_STATS_ARRAY)) + len(
+        userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
             self.USER_CONTINUAL_FEAT
         )
         # (商品id对应的嵌入向量 + 稀疏特征对应的嵌入向量 +      ) + 连续特征 + 多模态的embeding特征转换的嵌入向量 
@@ -634,7 +550,7 @@ class BaselineModel(torch.nn.Module):
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
 
-        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(self.USER_STATS_ARRAY)
+        usersenet_dim = (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT))
         itemsenet_dim =  (len(self.ITEM_SPARSE_FEAT) + 1 + len(self.ITEM_ARRAY_FEAT)) + len(self.ITEM_EMB_FEAT)
 
         self.senet_user = SENETLayer(filed_size=usersenet_dim + itemsenet_dim, reduction_ratio=3, seed=42, device=args.device)
@@ -648,16 +564,8 @@ class BaselineModel(torch.nn.Module):
         for _ in range(args.num_blocks):
 
             if args.use_hstu_attn:
-                new_attn_layer = SequentialTransductionUnitJagged(
-                    embedding_dim=args.hidden_units,
-                    linear_hidden_dim=args.hidden_units // args.num_heads,
-                    attention_dim=args.hidden_units // args.num_heads,
-                    normalization="hstu_rel_bias",
-                    linear_config="uvqk",
-                    linear_activation="silu",
-                    num_heads=args.num_heads, 
-                    dropout_ratio=0.0,
-                    attn_dropout_ratio=0.0,
+                new_attn_layer = HSTUAttention(
+                    args.hidden_units, args.num_heads, args.dropout_rate, 
                     relative_attention_bias_module=RelativeBucketedTimeAndPositionBasedBias(
                             max_seq_len= self.maxlen + 1,  # accounts for next item.
                             num_buckets=128,
@@ -667,19 +575,20 @@ class BaselineModel(torch.nn.Module):
                         ),
                         concat_ua=args.concat_ua
                 )
+
             else:
                 new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
                 self.attention_layernorms.append(new_attn_layernorm)
                 new_attn_layer = FlashMultiHeadAttention(
                     args.hidden_units, args.num_heads, args.dropout_rate
                 )  # 优化：用FlashAttention替代标准Attention
-            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
-            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
+                new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+                self.forward_layernorms.append(new_fwd_layernorm)
+
+                new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
+                self.forward_layers.append(new_fwd_layer)
+
             self.attention_layers.append(new_attn_layer)
-
-
 
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
@@ -706,7 +615,6 @@ class BaselineModel(torch.nn.Module):
         self.ITEM_CONTINUAL_FEAT = feat_types['item_continual']
         self.USER_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['user_array']}
         self.ITEM_ARRAY_FEAT = {k: feat_statistics[k] for k in feat_types['item_array']}
-        self.USER_STATS_ARRAY = {k: feat_statistics[k] for k in feat_types['user_stats_array']}
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         self.ITEM_EMB_FEAT = {k: EMB_SHAPE_DICT[k] for k in feat_types['item_emb']}  # 记录的是不同多模态特征的维度
 
@@ -774,11 +682,9 @@ class BaselineModel(torch.nn.Module):
                     (self.USER_SPARSE_FEAT, 'user_sparse', user_feat_list),
                     (self.USER_ARRAY_FEAT, 'user_array', user_feat_list),
                     (self.USER_CONTINUAL_FEAT, 'user_continual', user_feat_list),
-                    (self.USER_STATS_ARRAY, 'user_stats_array', user_feat_list),
                 ]
             )
         
-        continue_feat_list = []
         # batch-process each feature type
         for feat_dict, feat_type, feat_list in all_feat_types:
             if not feat_dict:
@@ -787,12 +693,10 @@ class BaselineModel(torch.nn.Module):
                 tensor_feature = self.feat2tensor(feature_array, k)
                 if feat_type.endswith('sparse'):
                     feat_list.append(self.sparse_emb[k](tensor_feature))
-                elif feat_type.endswith('user_stats_array'):
-                    feat_list.append(self.user_emb(tensor_feature).sum(2))
                 elif feat_type.endswith('array'):
-                    feat_list.append(self.sparse_emb[k](tensor_feature ).sum(2))
+                    feat_list.append(self.sparse_emb[k](tensor_feature).sum(2))
                 elif feat_type.endswith('continual'):
-                    continue_feat_list.append(tensor_feature.unsqueeze(2))
+                    feat_list.append(tensor_feature.unsqueeze(2))
         
         # 时间特征改为由dataset提供，这里不再追加
         
@@ -819,7 +723,6 @@ class BaselineModel(torch.nn.Module):
             all_user_emb = all_user_emb.view(batch_size*seq_len, -1, all_user_emb.shape[-1])
             all_user_emb = self.senet_user(all_user_emb)
             all_user_emb = all_user_emb.view(batch_size, seq_len, -1)
-            all_user_emb = torch.cat([all_user_emb, torch.cat(continue_feat_list, dim=2)], dim=2)
             seqs_emb = self.userdnn(all_user_emb)
         else:
             all_item_emb = torch.stack(item_feat_list, dim=2)
@@ -845,10 +748,10 @@ class BaselineModel(torch.nn.Module):
         # [batch_size, maxlen, hidden_unit]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True, timestamps=seq_timestamp)
         seqs *= self.item_emb.embedding_dim**0.5
-        # poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        # poss *= log_seqs != 0
-        # # [batch_size, maxlen, hidden_units]
-        # seqs += self.pos_emb(poss)
+        poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
+        poss *= log_seqs != 0
+        # [batch_size, maxlen, hidden_units]
+        seqs += self.pos_emb(poss)
         seqs = self.emb_dropout(seqs)
 
         maxlen = seqs.shape[1]
@@ -866,12 +769,11 @@ class BaselineModel(torch.nn.Module):
         seq_timestamp = seq_timestamp.to(self.dev)
         for i in range(len(self.attention_layers)):
             if self.use_hstu_attn:
-                seqs, _ = self.attention_layers[i](seqs, attention_mask=attention_mask, all_timestamps=seq_timestamp)
-                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
+                seqs, _ = self.attention_layers[i](seqs, attn_mask=attention_mask, all_timestamps=seq_timestamp)
             else:
                 if self.norm_first:
-                    x = self.attention_layernorms[i](seqs)
-                    mha_outputs, _ = self.attention_layers[i](x, attention_mask=attention_mask, all_timestamps=seq_timestamp)
+                    x, _ = self.attention_layernorms[i](seqs)
+                    mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask, all_timestamps=seq_timestamp)
                     seqs = seqs + mha_outputs
                     seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
                 else:

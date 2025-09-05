@@ -17,6 +17,21 @@ from InfoNCE import InfoNCE
 import random
 import math
 
+def get_memory_stats():
+    if not torch.cuda.is_available():
+        return None
+    d = torch.device("cuda")
+    alloc = torch.cuda.memory_allocated(d)
+    reserv = torch.cuda.memory_reserved(d)
+    peak_alloc = torch.cuda.max_memory_allocated(d)
+    peak_reserv = torch.cuda.max_memory_reserved(d)
+    return {
+        'alloc_MB': alloc / 1e6,
+        'reserv_MB': reserv / 1e6,
+        'peak_alloc_MB': peak_alloc / 1e6,
+        'peak_reserv_MB': peak_reserv / 1e6
+    }
+
 class WarmupCosineScheduler:
     """
     Warmup + Cosine Annealing Learning Rate Scheduler
@@ -109,9 +124,9 @@ def get_args():
     # 性能优化参数
     parser.add_argument('--use_gradient_checkpointing', action='store_true', help='启用梯度检查点以减少内存占用')
     parser.add_argument('--compile_model', action='store_true', help='使用torch.compile优化模型')
-    parser.add_argument('--use_amp', action='store_false', default=True, help='使用混合精度训练')
+    parser.add_argument('--use_amp', action='store_true', default=False, help='使用混合精度训练')
     parser.add_argument('--optimize_backward', action='store_true', default=True, help='启用backward性能优化')
-    parser.add_argument('--gradient_clip', default=0.0, type=float, help='梯度裁剪阈值')
+    parser.add_argument('--gradient_clip', default=1.0, type=float, help='梯度裁剪阈值')
     parser.add_argument('--grad_norm_freq', default=20, type=int, help='梯度范数计算频率（每N步计算一次）')
     parser.add_argument('--log_freq', default=10, type=int, help='日志记录频率（每N步记录一次）')
     parser.add_argument('--print_freq', default=10, type=int, help='控制台打印频率（每N步打印一次）')
@@ -121,7 +136,8 @@ def get_args():
     parser.add_argument('--warmup_steps', default=1000, type=int, help='Warmup步数')
     parser.add_argument('--warmup_lr', default=1e-6, type=float, help='Warmup起始学习率')
     parser.add_argument('--min_lr', default=1e-7, type=float, help='最小学习率')
-    
+    parser.add_argument('--weight_decay', default=1e-4, type=float, help='权重衰减')
+
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
     
@@ -130,34 +146,6 @@ def get_args():
 
     return args
 
-# 1. 模型参数显存（固定值，与batch无关）
-def get_model_param_memory(model):
-    total = 0
-    for param in model.parameters():
-        total += param.numel() * param.element_size()  # 元素数量 × 单个元素字节数
-    return total / 1024**2  # 转换为MB
-
-# 2. 输入数据显存（与batch_size线性相关）
-def get_input_memory(input_tensor):
-    return input_tensor.element_size() * input_tensor.nelement() / 1024**2  # MB
-
-# 3. 中间变量+梯度的峰值显存（前向+反向传播）
-def get_peak_memory():
-    # 活跃显存峰值（包含中间变量、梯度等）
-    peak_active = torch.cuda.memory_stats()["active_bytes.all.peak"] / 1024**2
-    # 缓存显存（框架优化用，如CuDNN卷积缓存）
-    peak_reserved = torch.cuda.memory_stats()["reserved_bytes.all.peak"] / 1024**2
-    return peak_active, peak_reserved
-
-# 4. 优化器状态显存（如Adam需要存储动量和二阶矩）
-def get_optimizer_memory(optimizer):
-    total = 0
-    for param_group in optimizer.param_groups:
-        for param in param_group['params']:
-            # 每个参数的优化器状态（如Adam有2个额外状态）
-            if param.grad is not None:
-                total += param.grad.numel() * param.grad.element_size() * 2  # 假设Adam
-    return total / 1024**2  # MB
 
 if __name__ == '__main__':   
     set_seed(42)
@@ -169,10 +157,8 @@ if __name__ == '__main__':
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
-    args.save_path = os.environ.get('USER_CACHE_PATH')
-
     dataset = MyDataset(data_path, args)
-    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
+    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.995, 0.005])
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker, pin_memory=True,
     )
@@ -200,7 +186,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    optimizer = torch.optim.AdamW(model.parameters(), weight_decay=args.weight_decay,  lr=args.lr, betas=(0.9, 0.98))
     scaler = GradScaler('cuda')  # 梯度缩放器，防止 FP16 下溢
     
     # 创建学习率调度器
@@ -268,25 +254,33 @@ if __name__ == '__main__':
             
             # 条件使用混合精度
             if args.use_amp:
-                with autocast('cuda'):
+                with autocast('cuda', dtype=torch.float16):
                     log_feats, pos_embs, neg_embs = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
                     )
+                    t2 = time.time()
+                    indices = np.where(next_token_type == 1)
+                    if not args.use_all_in_batch:
+                        loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+                    else:
+                        pos_mask = model.posmask(pos)
+                        x_index,y_index = indices
+                        selected_masks = pos_mask[indices]
+                        loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
             else:
                 log_feats, pos_embs, neg_embs = model(
                     seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
                 )
-            
-            t2 = time.time()
-            indices = np.where(next_token_type == 1)
-            if not args.use_all_in_batch:
-                loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
-            else:
-                pos_mask = model.posmask(pos)
-                x_index,y_index = indices
-                selected_masks = pos_mask[indices]
-                loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
-            
+                t2 = time.time()
+                indices = np.where(next_token_type == 1)
+                if not args.use_all_in_batch:
+                    loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+                else:
+                    pos_mask = model.posmask(pos)
+                    x_index,y_index = indices
+                    selected_masks = pos_mask[indices]
+                    loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
+                
             t3 = time.time()
             
             # 日志记录优化 - 降低频率
@@ -305,7 +299,13 @@ if __name__ == '__main__':
                 writer.add_scalar('Click_acc/train', future_click_acc, global_step)
                 writer.add_scalar('Pos_sim/train', pos_sim, global_step)
                 writer.add_scalar('Neg_sim/train', neg_sim, global_step)
-            
+                mem = get_memory_stats()
+                if mem is not None:
+                    writer.add_scalar('memory/allocated_MB', mem['alloc_MB'], global_step=global_step)
+                    writer.add_scalar('memory/reserved_MB', mem['reserv_MB'], global_step=global_step)
+                    writer.add_scalar('memory/peak_alloc_MB', mem['peak_alloc_MB'], global_step=global_step)
+                    writer.add_scalar('memory/peak_reserv_MB', mem['peak_reserv_MB'], global_step=global_step)
+                
             # 控制台打印优化 - 降低频率
             if step % args.print_freq == 0:
                 elapsed_str = _format_elapsed(time.time() - t0)
@@ -417,17 +417,33 @@ if __name__ == '__main__':
                 seq = seq.to(args.device)
                 pos = pos.to(args.device)
                 neg = neg.to(args.device)
-                log_feats, pos_embs, neg_embs  = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
-                )
-                indices = np.where(next_token_type == 1)
-                if not args.use_all_in_batch:
-                    loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+                # 条件使用混合精度
+                if args.use_amp:
+                    with autocast('cuda', dtype=torch.float16):
+                        log_feats, pos_embs, neg_embs  = model(
+                            seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
+                        )
+                        indices = np.where(next_token_type == 1)
+                        if not args.use_all_in_batch:
+                            loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+                        else:
+                            pos_mask = model.posmask(pos)
+                            x_index,y_index = indices
+                            selected_masks = pos_mask[indices]
+                            loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
                 else:
-                    pos_mask = model.posmask(pos)
-                    x_index,y_index = indices
-                    selected_masks = pos_mask[indices]
-                    loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
+                    log_feats, pos_embs, neg_embs  = model(
+                        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
+                    )
+                    indices = np.where(next_token_type == 1)
+                    if not args.use_all_in_batch:
+                        loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs)
+                    else:
+                        pos_mask = model.posmask(pos)
+                        x_index,y_index = indices
+                        selected_masks = pos_mask[indices]
+                        loss, acc, pos_sim, neg_sim, future_click_acc = infonce_criterion(log_feats[indices], pos_embs[indices], neg_embs, pos_mask=selected_masks[:,x_index,y_index])
+
                 valid_loss_sum += loss.item()
                 valid_acc_sum += acc
                 valid_pos_sim_sum += pos_sim
