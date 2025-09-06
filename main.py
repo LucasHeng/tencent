@@ -186,7 +186,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
     
-    optimizer = torch.optim.AdamW(model.parameters(), weight_decay=args.weight_decay,  lr=args.lr, betas=(0.9, 0.98))
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
     scaler = GradScaler('cuda')  # 梯度缩放器，防止 FP16 下溢
     
     # 创建学习率调度器
