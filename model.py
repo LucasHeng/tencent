@@ -229,23 +229,18 @@ class HSTUAttention(torch.nn.Module):
             in_features=hidden_units * (3 if concat_ua else 1),
             out_features=hidden_units,
         )
-        torch.nn.init.xavier_uniform_(self._o.weight)
         self._eps = 1e-8
-
-    def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(x, normalized_shape=[self.hidden_units], eps=self._eps)
 
     def _norm_attn_output(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(
-            x, normalized_shape=[self.hidden_units], eps=self._eps
+            x, normalized_shape=[self.head_dim * self.num_heads], eps=self._eps
         )
 
     def forward(self, x, all_timestamps=None, attn_mask=None):
         batch_size, seq_len, _ = x.size()
         
-        normed_x = self._norm_input(x)
         # 计算qkvu
-        batched_mm_output = torch.matmul(normed_x, self._uvqk)
+        batched_mm_output = torch.matmul(x, self._uvqk)
         batched_mm_output = F.silu(batched_mm_output)
         U, V, Q, K = torch.split(
                 batched_mm_output,
@@ -285,7 +280,6 @@ class HSTUAttention(torch.nn.Module):
                     training=self.training,
                 )
             )
-            + x
         )
         return new_outputs, None
 
@@ -536,6 +530,7 @@ class BaselineModel(torch.nn.Module):
         self.forward_layernorms = torch.nn.ModuleList()
         self.forward_layers = torch.nn.ModuleList()
         self.use_hstu_attn = args.use_hstu_attn
+        self.sample_neg_num = args.sample_neg_num
 
         self._init_feat_info(feat_statistics, feat_types)
 
@@ -562,6 +557,8 @@ class BaselineModel(torch.nn.Module):
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
 
         for _ in range(args.num_blocks):
+            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+            self.attention_layernorms.append(new_attn_layernorm)
 
             if args.use_hstu_attn:
                 new_attn_layer = HSTUAttention(
@@ -575,6 +572,13 @@ class BaselineModel(torch.nn.Module):
                         ),
                         concat_ua=args.concat_ua
                 )
+                if self.norm_first:
+                    new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+                    self.forward_layernorms.append(new_fwd_layernorm)
+
+                    new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
+                    self.forward_layers.append(new_fwd_layer)
+
 
             else:
                 new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
@@ -769,10 +773,14 @@ class BaselineModel(torch.nn.Module):
         seq_timestamp = seq_timestamp.to(self.dev)
         for i in range(len(self.attention_layers)):
             if self.use_hstu_attn:
-                seqs, _ = self.attention_layers[i](seqs, attn_mask=attention_mask, all_timestamps=seq_timestamp)
+                x = self.attention_layernorms[i](seqs)
+                mha_outputs, _ = self.attention_layers[i](x, attn_mask=attention_mask, all_timestamps=seq_timestamp)
+                seqs = seqs + mha_outputs
+                if self.norm_first:
+                    seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
             else:
                 if self.norm_first:
-                    x, _ = self.attention_layernorms[i](seqs)
+                    x = self.attention_layernorms[i](seqs)
                     mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask, all_timestamps=seq_timestamp)
                     seqs = seqs + mha_outputs
                     seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
@@ -833,32 +841,39 @@ class BaselineModel(torch.nn.Module):
 
         # [batch_size,  max_len, hidden_uinit]
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
-        batch_size = neg_seqs.shape[0]
-        seq_len = neg_seqs.shape[1]
-        neg_num = neg_seqs.shape[2]
-        # flatten negatives in packed format
-        if not isinstance(neg_feature, dict):
-            raise ValueError("neg_feature must be packed dict from collate_fn")
-        neg_feature_flat = {}
-        for k in self.ITEM_SPARSE_FEAT:
-            if k in neg_feature:
-                neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num)
-        for k in self.ITEM_CONTINUAL_FEAT:
-            if k in neg_feature:
-                neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num)
-        for k in self.ITEM_ARRAY_FEAT:
-            if k in neg_feature:
-                # [B, L, K, A] -> [B, L*K, A]
-                A = neg_feature[k].shape[-1]
-                neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num, A)
-        for k in self.ITEM_EMB_FEAT:
-            if k in neg_feature:
-                # [B, L, K, E] -> [B, L*K, E]
-                E = neg_feature[k].shape[-1]
-                neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num, E)
-        neg_seqs_flat = neg_seqs.reshape(batch_size, -1)
-        neg_embs = self.feat2emb(neg_seqs_flat, neg_feature_flat, include_user=False)
-        neg_embs = neg_embs.reshape(batch_size, seq_len, neg_num, -1)
+        loss_mask = loss_mask.unsqueeze(-1)
+        pos_embs = pos_embs * loss_mask        
+
+        if self.sample_neg_num > 0:
+            batch_size = neg_seqs.shape[0]
+            seq_len = neg_seqs.shape[1]
+            neg_num = neg_seqs.shape[2]
+            # flatten negatives in packed format
+            if not isinstance(neg_feature, dict):
+                raise ValueError("neg_feature must be packed dict from collate_fn")
+            neg_feature_flat = {}
+            for k in self.ITEM_SPARSE_FEAT:
+                if k in neg_feature:
+                    neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num)
+            for k in self.ITEM_CONTINUAL_FEAT:
+                if k in neg_feature:
+                    neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num)
+            for k in self.ITEM_ARRAY_FEAT:
+                if k in neg_feature:
+                    # [B, L, K, A] -> [B, L*K, A]
+                    A = neg_feature[k].shape[-1]
+                    neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num, A)
+            for k in self.ITEM_EMB_FEAT:
+                if k in neg_feature:
+                    # [B, L, K, E] -> [B, L*K, E]
+                    E = neg_feature[k].shape[-1]
+                    neg_feature_flat[k] = neg_feature[k].reshape(batch_size, seq_len * neg_num, E)
+            neg_seqs_flat = neg_seqs.reshape(batch_size, -1)
+            neg_embs = self.feat2emb(neg_seqs_flat, neg_feature_flat, include_user=False)
+            neg_embs = neg_embs.reshape(batch_size, seq_len, neg_num, -1)
+            neg_embs = neg_embs.reshape(-1, neg_embs.shape[-1])
+
+            return log_feats, pos_embs, neg_embs
 
         # [batch_size, max_len]
         # pos_logits = (log_feats * pos_embs).sum(dim=-1)
@@ -866,11 +881,8 @@ class BaselineModel(torch.nn.Module):
     
         # pos_logits = pos_logits * loss_mask
         # neg_logits = neg_logits * loss_mask
-        loss_mask = loss_mask.unsqueeze(-1)
-        pos_embs = pos_embs * loss_mask
-        
-        neg_embs = neg_embs.reshape(-1, neg_embs.shape[-1])
-        return log_feats, pos_embs, neg_embs
+
+        return log_feats, pos_embs, None    
 
     def predict(self, log_seqs, seq_feature, mask, seq_timestamp):
         """

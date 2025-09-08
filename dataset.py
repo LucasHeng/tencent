@@ -4,8 +4,189 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
+
+
+class PopularityNegativeSampler:
+    def __init__(self, data_file_path, seq_offsets, alpha=0.75, popularity_cache_path=None, itemnum=None):
+        """
+        初始化基于流行度的负采样器，在初始化时从seq.jsonl统计流行度
+        :param item_feat_dict: 物品特征字典，用于获取所有有效的物品ID
+        :param data_file_path: seq.jsonl文件路径
+        :param seq_offsets: 用户序列偏移量字典
+        :param popularity_cache_path: 流行度统计缓存文件路径（.npy），存在则直接加载
+        :param alpha: 平滑参数，控制流行度权重（默认0.75）
+        """
+        self.alpha = alpha
+        self.popularity_cache_path = popularity_cache_path
+        
+        # 构建物品ID空间：需要提供itemnum，直接使用1..itemnum
+        if itemnum is not None:
+            self.num_items = int(itemnum)
+            self.items = np.arange(1, self.num_items + 1, dtype=np.int32)
+            # counts采用1-based索引，0号位空置，便于直接用item_id作为下标
+            self.item_counts = np.zeros(self.num_items + 1, dtype=np.float64)
+        else:
+            raise ValueError("itemnum is required for PopularityNegativeSampler")
+        
+        
+        # 优先尝试从缓存加载；否则统计后保存
+        if isinstance(self.popularity_cache_path, (str, Path)) and Path(self.popularity_cache_path).exists():
+            try:
+                loaded = np.load(self.popularity_cache_path)
+                # 兼容长度不一致时的安全处理
+                if loaded.shape[0] == self.item_counts.shape[0]:
+                    self.item_counts = loaded.astype(np.float64, copy=False)
+                else:
+                    # 长度不匹配则重新统计
+                    self._compute_popularity_from_file(data_file_path, seq_offsets)
+                    np.save(self.popularity_cache_path, self.item_counts)
+            except Exception:
+                # 读取失败则重新统计并保存
+                self._compute_popularity_from_file(data_file_path, seq_offsets)
+                try:
+                    np.save(self.popularity_cache_path, self.item_counts)
+                except Exception:
+                    pass
+        else:
+            # 在初始化时统计流行度并尝试保存
+            self._compute_popularity_from_file(data_file_path, seq_offsets)
+            if isinstance(self.popularity_cache_path, (str, Path)):
+                try:
+                    Path(self.popularity_cache_path).parent.mkdir(parents=True, exist_ok=True)
+                    np.save(self.popularity_cache_path, self.item_counts)
+                except Exception:
+                    pass
+        
+        # 计算采样概率分布
+        self._update_sampling_probs()
+        print(f"Load popularity cache from {self.popularity_cache_path}")
+
+    def _compute_popularity_from_file(self, data_file_path, seq_offsets):
+        """
+        从seq.jsonl文件中统计物品流行度，不保留文件句柄
+        :param data_file_path: seq.jsonl文件路径
+        :param seq_offsets: 用户序列偏移量字典
+        """
+        total_users = len(seq_offsets)
+        print(f"正在从 {total_users} 个用户序列中统计物品流行度...")
+        
+        # 仅在本方法作用域内打开一次文件句柄，遍历所有偏移读取
+        try:
+            with open(data_file_path, 'rb') as f:
+                for uid in tqdm(range(total_users), desc="统计物品流行度"):
+                    try:
+                        f.seek(seq_offsets[uid])
+                        line = f.readline()
+                        user_sequence = json.loads(line)
+                        # 统计该用户序列中的物品交互次数
+                        for record_tuple in user_sequence:
+                            _, item_id, _, _, _, _ = record_tuple
+                            if item_id:
+                                # 直接按1..itemnum的下标累加（0号位空置）或在items映射中查找
+                                if self.item_counts.shape[0] == self.num_items + 1:
+                                    if 0 < item_id <= self.num_items:
+                                        self.item_counts[item_id] += 1
+                                else:
+                                    # 退化为查找映射
+                                    item_idx = np.where(self.items == item_id)[0]
+                                    if len(item_idx) > 0:
+                                        self.item_counts[item_idx[0]] += 1
+                    except Exception as e:
+                        print(f"处理用户 {uid} 时出错: {e}")
+                        continue
+        except Exception as e:
+            print(f"打开数据文件失败: {e}")
+        
+        print(f"物品流行度统计完成，共处理 {total_users} 个用户序列")
+
+    def _update_sampling_probs(self):
+        """
+        更新采样概率分布
+        """
+        # 构造与self.items对齐的计数向量（若1-based则跳过0号位）
+        if self.item_counts.shape[0] == self.num_items + 1:
+            counts_vec = self.item_counts[1:]
+        else:
+            counts_vec = self.item_counts
+        # 避免除零错误，给所有物品至少1次计数
+        counts_safe = counts_vec + 1
+    
+        # # ✅ 计算逆流行度概率：P(i) ∝ 1 / (freq_i + 1)^α
+        # inv_counts_pow = 1.0 / (counts_safe ** self.alpha)
+        
+        # # 归一化为概率分布
+        # self.total = inv_counts_pow.sum()
+        # self.sampling_probs = inv_counts_pow / self.total
+        # # 预计算累积概率分布（用于加速采样）
+        # self.cum_probs = np.cumsum(self.sampling_probs)
+
+        # 计算采样概率分布（流行度^alpha / 总流行度^alpha）
+        counts_pow = counts_safe ** self.alpha
+        self.total = counts_pow.sum()
+        self.sampling_probs = counts_pow / self.total
+        
+        # 预计算累积概率分布（加速采样）
+        self.cum_probs = np.cumsum(self.sampling_probs)
+
+    def sample(self, num_samples=13056, positive_items=None):
+        """
+        生成指定数量的负样本
+        :param num_samples: 负样本数量（默认102*128=13056）
+        :param positive_items: 需要排除的正样本集合（如用户已交互的物品，可选）
+        :return: 负样本数组（长度为num_samples）
+        """
+        # 检查cum_probs是否正确初始化
+        if self.cum_probs is None or len(self.cum_probs) == 0:
+            raise ValueError("cum_probs未正确初始化，请检查_popularity_from_file方法")
+        
+        # 为避免采样到重复样本或正样本，多采20%作为候选
+        candidate_size = int(num_samples * 1.2)
+        if candidate_size < num_samples:
+            candidate_size = num_samples
+        
+        # 1. 基于累积概率快速采样（比np.random.choice(p=...)更快）
+        rand_vals = np.random.random(candidate_size)  # 生成[0,1)随机数
+        # 找到随机数在累积概率中的位置，对应物品索引
+        candidate_indices = np.searchsorted(self.cum_probs, rand_vals)
+        candidates = self.items[candidate_indices]  # 候选负样本
+        
+        # 2. 过滤正样本（如果需要）
+        if positive_items is not None:
+            # 转换为集合加速查找（假设positive_items是列表或数组）
+            positive_set = set(positive_items)
+            # 过滤掉候选中属于正样本的元素
+            candidates = [item for item in candidates if item not in positive_set]
+            # 转换回NumPy数组
+            candidates = np.array(candidates, dtype=self.items.dtype)
+        
+        # 3. 去重（保留顺序，确保样本多样性）
+        # 用np.unique去重并保留首次出现的顺序
+        _, unique_indices = np.unique(candidates, return_index=True)
+        unique_candidates = candidates[np.sort(unique_indices)]
+        
+        # 4. 确保样本数量足够（若候选不足，补充采样）
+        if len(unique_candidates) < num_samples:
+            # 计算还需要补充的样本数
+            need = num_samples - len(unique_candidates)
+            # 补充采样（直接用np.random.choice，速度略慢但确保数量）
+            additional_samples = np.random.choice(
+                self.items,
+                size=need,
+                p=self.sampling_probs,
+                replace=False  # 不重复
+            )
+            # 再次过滤正样本（如果需要）
+            if positive_items is not None:
+                additional_samples = [item for item in additional_samples if item not in positive_set]
+                additional_samples = np.array(additional_samples, dtype=self.items.dtype)
+            # 合并并再次去重
+            unique_candidates = np.unique(np.concatenate([unique_candidates, additional_samples]))
+        
+        # 5. 截取需要的数量并返回
+        return unique_candidates[:num_samples]
 
 
 class MyDataset(torch.utils.data.Dataset):
@@ -59,12 +240,6 @@ class MyDataset(torch.utils.data.Dataset):
         self.sample_neg_num = args.sample_neg_num
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
-        # 统计时间间隔分桶：类别0为padding，1为零间隔，2..为各边界桶
-        try:
-            self._tdelta_bucket_counts = np.zeros(int(self._safe_feat_stat('1304')) + 1, dtype=np.int64)
-        except Exception:
-            self._tdelta_bucket_counts = np.zeros(32, dtype=np.int64)
-        self._tdelta_total = 0
         # 缓存时间分桶边界，避免 __getitem__ 重复创建
         self._tdelta_edges = np.array([
             30, 60, 120, 300, 600, 900, 1800,
@@ -72,6 +247,20 @@ class MyDataset(torch.utils.data.Dataset):
             43200, 64800, 86400, 129600, 172800,
             259200, 432000, 604800, 1209600
         ], dtype=np.int64)
+        
+        # 初始化基于流行度的负采样器（仅在需要负采样时创建）
+        self.negative_sampler = None
+        enable_neg = getattr(args, 'enable_negative_sampling', True)
+        if enable_neg and self.sample_neg_num > 0:
+            self.save_path = args.save_path
+            popularity_cache_path = Path(self.save_path, "popularity_counts.npy")
+            self.negative_sampler = PopularityNegativeSampler(
+                self._data_file_path,
+                self.seq_offsets,
+                alpha = args.alpha,
+                popularity_cache_path=popularity_cache_path,
+                itemnum=self.itemnum
+            )
 
     def _safe_feat_stat(self, k):
         return self._get_feat_stat(self._ensure_feat_stats(), k)
@@ -128,25 +317,22 @@ class MyDataset(torch.utils.data.Dataset):
         except Exception:
             pass
 
-    def _random_neq(self, l, r, s,neg_num=1):
+    def _random_neq(self, s, neg_num=1):
         """
-        生成一个不在序列s中的随机整数, 用于训练时的负采样
+        使用基于流行度的负采样生成不在序列s中的随机整数
 
         Args:
-            l: 随机整数的最小值
-            r: 随机整数的最大值
-            s: 序列
+            l: 随机整数的最小值（保留兼容性，实际不使用）
+            r: 随机整数的最大值（保留兼容性，实际不使用）
+            s: 序列（正样本集合）
+            neg_num: 负样本数量
 
         Returns:
-            t: 不在序列s中的随机整数
+            neg_samps: 不在序列s中的负样本列表
         """
-        neg_samps = []
-        for i in range(neg_num):
-            t = np.random.randint(l, r)
-            while t in s or str(t) not in self.item_feat_dict:
-                t = np.random.randint(l, r)
-            neg_samps.append(t)
-        return neg_samps
+        # 使用基于流行度的负采样
+        neg_samps = self.negative_sampler.sample(num_samples=neg_num, positive_items=s)
+        return neg_samps.tolist()
 
     def __getitem__(self, uid):
         """
@@ -222,16 +408,13 @@ class MyDataset(torch.utils.data.Dataset):
                 pos[idx] = next_i
                 # pos时间特征使用默认值（不显式赋值）
                 pos_feat[idx] = next_feat
-                neg_ids = self._random_neq(1, self.itemnum + 1, ts, self.sample_neg_num)
-                neg[idx] = neg_ids
-                for id,neg_id in enumerate(neg_ids):
-                    nf = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
-                    # neg时间特征使用默认值（不显式赋值）
-                    neg_feat[idx][id] = nf
             nxt = record_tuple
             idx -= 1
             if idx == -1:
                 break
+
+        # 训练时的负样本采样移动到 collate_fn 中统一进行；此处不再填充 neg/neg_feat
+        
 
         seq_feat = np.where(seq_feat == None, self.feature_default_value, seq_feat)
         # 回填1304：使用“当前-前一条”的时间差，按固定边界分桶（前密后疏），非零分桶+1；首位为0
@@ -261,15 +444,8 @@ class MyDataset(torch.utils.data.Dataset):
             if isinstance(seq_feat[t], dict):
                 c = int(cats[t])
                 seq_feat[t]['1304'] = c
-                # 统计：仅对item记录计数（包含padding=0、零间隔=1、其余=2..）
-                if tt_np[t] == 1:
-                    idx = c
-                    if 0 <= idx < self._tdelta_bucket_counts.shape[0]:
-                        self._tdelta_bucket_counts[idx] += 1
-                    self._tdelta_total += 1
         pos_feat = np.where(pos_feat == None, self.feature_default_value, pos_feat)
         neg_feat = np.where(neg_feat == None, self.feature_default_value, neg_feat)
-
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp
 
     def __len__(self):
@@ -281,21 +457,6 @@ class MyDataset(torch.utils.data.Dataset):
         """
         return len(self.seq_offsets)
 
-    def report_time_delta_hist(self):
-        """
-        打印时间间隔分桶的频率统计（占比）。
-        0: padding/首个item；1: 真实零间隔；2..: 固定边界桶。
-        """
-        if getattr(self, '_tdelta_total', 0) == 0:
-            print('[time-delta] no samples counted yet')
-            return
-        total = max(1, int(self._tdelta_total))
-        counts = self._tdelta_bucket_counts[:]
-        # 输出前若干桶的占比
-        print('[time-delta] bucket ratios:')
-        for i, c in enumerate(counts):
-            ratio = float(c) / total
-            print(f'  bucket {i}: count={int(c)} ratio={ratio:.6f}')
 
     def _init_feat_info(self):
         """
@@ -312,7 +473,7 @@ class MyDataset(torch.utils.data.Dataset):
         feat_types['item_sparse'] = [
             '100',
             '117',
-            '111',
+            # '111',
             '118',
             '101',
             '102',
@@ -417,7 +578,7 @@ class MyDataset(torch.utils.data.Dataset):
         seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat, seq_timestamp = zip(*batch)
         seq = torch.from_numpy(np.array(seq))
         pos = torch.from_numpy(np.array(pos))
-        neg = torch.from_numpy(np.array(neg))
+        # 重新在collate中统一采样负样本：忽略各样本的neg，重新生成
         token_type = torch.from_numpy(np.array(token_type))
         next_token_type = torch.from_numpy(np.array(next_token_type))
         next_action_type = torch.from_numpy(np.array(next_action_type))
@@ -471,7 +632,6 @@ class MyDataset(torch.utils.data.Dataset):
 
         seq_feat_list = list(seq_feat)
         pos_feat_list = list(pos_feat)
-        neg_feat_list = list(neg_feat)
 
         # pack seq & pos features using known feature id groups
         seq_feat_pre = {}
@@ -492,8 +652,33 @@ class MyDataset(torch.utils.data.Dataset):
         seq_feat_pre.update(build_emb(self.feature_types['item_emb'], seq_feat_list))
         pos_feat_pre.update(build_emb(self.feature_types['item_emb'], pos_feat_list))
 
-        # pack negatives: shapes -> sparse/continual [B, L, K], array [B, L, K, A], emb [B, L, K, E]
-        K = neg.shape[-1]
+        # 在collate中统一负采样（仅当训练集启用采样器）
+        B = seq.shape[0]
+        L = seq.shape[1]
+        K = self.sample_neg_num
+        if getattr(self, 'negative_sampler', None) is not None:
+            # 1) 收集整batch的正样本集合（去重）
+            pos_np = pos.numpy()
+            # next_token_type==1 的位置才有正样本
+            ntt_np = next_token_type.numpy()
+            mask = (ntt_np == 1)
+            positive_set = set(pos_np[mask].tolist())
+            if 0 in positive_set:
+                positive_set.discard(0)
+            # 2) 一次性采样 B*L*K*2 候选并过滤
+            total_slots = B * L * K
+            candidate_size = total_slots * 2
+            pool = self.negative_sampler.sample(num_samples=candidate_size, positive_items=positive_set)
+            if len(pool) < total_slots:
+                extra_need = total_slots - len(pool)
+                if extra_need > 0:
+                    extra = self.negative_sampler.sample(num_samples=extra_need, positive_items=positive_set)
+                    pool = np.concatenate([pool, extra])
+            pool = pool[:total_slots]
+            neg = torch.from_numpy(pool.reshape(B, L, K).astype(np.int32))
+        else:
+            # 测试或未启用采样器：保留占位形状
+            neg = torch.zeros((B, L, K), dtype=torch.int32)
 
         def build_dense_neg(feat_ids, batch_list, dtype='int'):
             if dtype == 'int':
@@ -552,11 +737,26 @@ class MyDataset(torch.utils.data.Dataset):
                 arrs[k] = arr
             return arrs
 
+        # 基于新采样的neg重建neg_feat（字典形式）
         neg_feat_pre = {}
-        neg_feat_pre.update(build_dense_neg(self.feature_types['item_sparse'], neg_feat_list, 'int'))
-        neg_feat_pre.update(build_dense_neg(self.feature_types['item_continual'], neg_feat_list, 'float'))
-        neg_feat_pre.update(build_array_neg(self.feature_types['item_array'], neg_feat_list))
-        neg_feat_pre.update(build_emb_neg(self.feature_types['item_emb'], neg_feat_list))
+        if getattr(self, 'negative_sampler', None) is not None:
+            # 构造与原先接口兼容的list[list[dict]]形式供下游打包
+            neg_feat = np.empty([B, L, K], dtype=object)
+            for b in range(B):
+                for t in range(L):
+                    for n in range(K):
+                        neg_id = int(neg[b, t, n].item())
+                        nf = self.fill_missing_feat(self.item_feat_dict[str(neg_id)], neg_id)
+                        neg_feat[b, t, n] = nf
+            # 重新使用已有的构建函数打包
+            neg_feat_list = list(neg_feat)
+            neg_feat_pre.update(build_dense_neg(self.feature_types['item_sparse'], neg_feat_list, 'int'))
+            neg_feat_pre.update(build_dense_neg(self.feature_types['item_continual'], neg_feat_list, 'float'))
+            neg_feat_pre.update(build_array_neg(self.feature_types['item_array'], neg_feat_list))
+            neg_feat_pre.update(build_emb_neg(self.feature_types['item_emb'], neg_feat_list))
+        else:
+            # 测试集保持空特征
+            neg_feat_pre = {k: np.zeros((B, L, K), dtype=np.int64) for k in self.feature_types['item_sparse']}
 
         return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat_pre, pos_feat_pre, neg_feat_pre, seq_timestamp
 
@@ -567,6 +767,8 @@ class MyTestDataset(MyDataset):
     """
 
     def __init__(self, data_dir, args):
+        # 强制禁用负采样器
+        args.enable_negative_sampling = False
         super().__init__(data_dir, args)
 
     def _load_data_and_offsets(self):
@@ -608,19 +810,9 @@ class MyTestDataset(MyDataset):
             user_id: user_id eg. user_xxxxxx ,便于后面对照答案
         """
         user_sequence = self._load_user_data(uid)  # 动态加载用户数据
-        if len(user_sequence) > self.max_length:
-            self.max_length = len(user_sequence)
-            print(f'max_length: {self.max_length}')
-        filter_user_sequence = []
-        pos = self.maxlen - 1
-        for record_tuple in reversed(user_sequence):
-            filter_user_sequence.append(record_tuple)
-            pos -= 1
-            if pos == 0:
-                break
-            
+
         ext_user_sequence = []
-        for record_tuple in reversed(filter_user_sequence):
+        for record_tuple in user_sequence:
             u, i, user_feat, item_feat, _, timestamp = record_tuple
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id

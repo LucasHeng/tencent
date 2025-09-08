@@ -124,7 +124,7 @@ def get_args():
     # 性能优化参数
     parser.add_argument('--use_gradient_checkpointing', action='store_true', help='启用梯度检查点以减少内存占用')
     parser.add_argument('--compile_model', action='store_true', help='使用torch.compile优化模型')
-    parser.add_argument('--use_amp', action='store_true', default=False, help='使用混合精度训练')
+    parser.add_argument('--use_amp', action='store_false', default=True, help='使用混合精度训练')
     parser.add_argument('--optimize_backward', action='store_true', default=True, help='启用backward性能优化')
     parser.add_argument('--gradient_clip', default=1.0, type=float, help='梯度裁剪阈值')
     parser.add_argument('--grad_norm_freq', default=20, type=int, help='梯度范数计算频率（每N步计算一次）')
@@ -136,7 +136,9 @@ def get_args():
     parser.add_argument('--warmup_steps', default=1000, type=int, help='Warmup步数')
     parser.add_argument('--warmup_lr', default=1e-6, type=float, help='Warmup起始学习率')
     parser.add_argument('--min_lr', default=1e-7, type=float, help='最小学习率')
-    parser.add_argument('--weight_decay', default=1e-4, type=float, help='权重衰减')
+    parser.add_argument('--alpha', default=0.5, type=float, help='流行度平滑参数')
+    parser.add_argument('--eval_full_pool', action='store_true', help='评估时使用全底池打分（HR@10/NDCG@10与线上对齐）')
+    parser.add_argument('--temperature', default=0.3, type=float, help='流行度平滑参数')
 
     # MMemb Feature ID
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
@@ -155,10 +157,12 @@ if __name__ == '__main__':
     writer = SummaryWriter(os.environ.get('TRAIN_TF_EVENTS_PATH'))
     # global dataset
     data_path = os.environ.get('TRAIN_DATA_PATH')
+    save_path = os.environ.get('USER_CACHE_PATH')
 
     args = get_args()
+    args.save_path = save_path
     dataset = MyDataset(data_path, args)
-    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.995, 0.005])
+    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker, pin_memory=True,
     )
@@ -230,7 +234,7 @@ if __name__ == '__main__':
             print(args.state_dict_path)
             raise RuntimeError('failed loading state_dicts, pls check file path!')
 
-    infonce_criterion = InfoNCE(temperature=0.03, reduction='mean')
+    infonce_criterion = InfoNCE(temperature=args.temperature, reduction='mean')
 
     best_val_ndcg, best_val_hr = 0.0, 0.0
     best_test_ndcg, best_test_hr = 0.0, 0.0
@@ -332,6 +336,16 @@ if __name__ == '__main__':
                 # 优化梯度范数计算 - 使用torch.nn.utils.clip_grad_norm_的底层实现
                 scaler.unscale_(optimizer)
                 
+                # 梯度裁剪优化（总是需要）
+                if args.gradient_clip > 0:
+                    params_with_grad = [p for p in model.parameters() if p.grad is not None]
+                    if len(params_with_grad) > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            params_with_grad,
+                            args.gradient_clip,
+                            error_if_nonfinite=False,
+                        )
+                
                 # 梯度范数计算优化 - 降低计算频率
                 if step % args.grad_norm_freq == 0:
                     total_norm = 0.0
@@ -346,15 +360,6 @@ if __name__ == '__main__':
                     total_norm = total_norm ** 0.5
                     writer.add_scalar('Grad Norm/Total', total_norm, step)
 
-                # 梯度裁剪优化（总是需要）
-                if args.gradient_clip > 0:
-                    params_with_grad = [p for p in model.parameters() if p.grad is not None]
-                    if len(params_with_grad) > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            params_with_grad,
-                            args.gradient_clip,
-                            error_if_nonfinite=False,
-                        )
                 
                 t5 = time.time()
                 scaler.step(optimizer)
